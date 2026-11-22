@@ -158,25 +158,20 @@ impl PartitionCursor {
         Some((partition_idx, split_start..split_end))
     }
 
-    fn remaining_upper_bound(&self) -> usize {
+    fn remaining_count(&self) -> u64 {
         if self.next_partition >= self.end_partition {
             return 0;
         }
-        let max_remaining = self.end_partition - self.next_partition;
-        let bound = match &self.partition_selection {
-            Selection::IncludeByIndex(include) => {
-                let slice = include.as_slice();
-                let start = slice.partition_point(|&idx| idx < self.next_partition);
-                let end = slice.partition_point(|&idx| idx < self.end_partition);
-                (end - start) as u64
-            }
-            _ => max_remaining,
-        };
-        usize::try_from(bound).unwrap_or(usize::MAX)
+        self.partition_selection
+            .row_count_in_range(&(self.next_partition..self.end_partition))
     }
 }
 
 /// An implementation of a [`DataSource`] that reads data from a [`LayoutReaderRef`].
+///
+/// Partitions are assigned on a fixed split grid starting at row 0 of the file: split `i` covers
+/// rows `[i * split_max_row_count, (i + 1) * split_max_row_count)` (clamped to the scan's
+/// `row_range` and the file's row count).
 pub struct LayoutReaderDataSource {
     reader: LayoutReaderRef,
     session: VortexSession,
@@ -444,7 +439,16 @@ impl Stream for LayoutReaderScan {
         {
             return (0, Some(0));
         }
-        (0, Some(self.cursor.remaining_upper_bound()))
+        let remaining = self.cursor.remaining_count();
+        let upper = usize::try_from(remaining).ok();
+        if self.remaining_limit.is_none() && self.row_limit.is_none() {
+            match upper {
+                Some(exact) => (exact, Some(exact)),
+                None => (usize::MAX, None),
+            }
+        } else {
+            (0, upper)
+        }
     }
 }
 
@@ -589,7 +593,16 @@ impl Stream for EmptyScan {
         if self.remaining_limit.is_some_and(|limit| limit == 0) {
             return (0, Some(0));
         }
-        (0, Some(self.cursor.remaining_upper_bound()))
+        let remaining = self.cursor.remaining_count();
+        let upper = usize::try_from(remaining).ok();
+        if self.remaining_limit.is_none() {
+            match upper {
+                Some(exact) => (exact, Some(exact)),
+                None => (usize::MAX, None),
+            }
+        } else {
+            (0, upper)
+        }
     }
 }
 
@@ -635,14 +648,20 @@ impl Partition for Empty {
 
 #[cfg(test)]
 mod tests {
+    use std::ops::Range;
     use std::sync::Arc;
 
     use futures::StreamExt;
     use futures::TryStreamExt;
     use rstest::rstest;
+    use vortex_array::dtype::Nullability;
+    use vortex_array::expr::Expression;
+    use vortex_array::expr::pack;
     use vortex_array::expr::root;
+    use vortex_array::expr::stats::Precision;
     use vortex_buffer::Buffer;
     use vortex_error::VortexResult;
+    use vortex_error::vortex_err;
     use vortex_io::runtime::BlockingRuntime;
     use vortex_io::runtime::single::SingleThreadRuntime;
     use vortex_metrics::DefaultMetricsRegistry;
@@ -801,8 +820,90 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn single_file_partition_selectors_and_empty_projection_match() -> VortexResult<()> {
+    fn empty_projection() -> Expression {
+        pack(
+            std::iter::empty::<(&str, Expression)>(),
+            Nullability::NonNullable,
+        )
+    }
+
+    fn index_selection(indices: &[u64], include: bool) -> VortexResult<Selection> {
+        let buffer = StrictSortedBuffer::try_new(Buffer::from_iter(indices.iter().copied()))?;
+        Ok(if include {
+            Selection::IncludeByIndex(buffer)
+        } else {
+            Selection::ExcludeByIndex(buffer)
+        })
+    }
+
+    fn roaring_selection(indices: &[u64], include: bool) -> VortexResult<Selection> {
+        let mut map = roaring::RoaringTreemap::new();
+        for &idx in indices {
+            map.insert(idx);
+        }
+        Ok(if include {
+            Selection::IncludeRoaring(map)
+        } else {
+            Selection::ExcludeRoaring(map)
+        })
+    }
+
+    #[rstest]
+    #[case::exclude_zero_with_limit(
+        None,
+        None,
+        index_selection(&[0], false),
+        Some(2),
+        vec![1],
+        vec![2, 3],
+        Precision::inexact(2usize),
+    )]
+    #[case::empty_include(
+        None,
+        None,
+        index_selection(&[], true),
+        None,
+        vec![],
+        vec![],
+        Precision::exact(0usize),
+    )]
+    #[case::roaring_include_with_partition_range(
+        None,
+        Some(1..3),
+        roaring_selection(&[0, 2], true),
+        None,
+        vec![2],
+        vec![4, 5],
+        Precision::exact(1usize),
+    )]
+    #[case::roaring_exclude_with_partition_range(
+        None,
+        Some(0..3),
+        roaring_selection(&[1], false),
+        None,
+        vec![0, 2],
+        vec![0, 1, 4, 5],
+        Precision::exact(2usize),
+    )]
+    #[case::row_range_preserves_split_grid_ids(
+        Some(2..6),
+        None,
+        index_selection(&[1], true),
+        None,
+        vec![1],
+        vec![2, 3],
+        Precision::exact(1usize),
+    )]
+    fn single_file_partition_selectors_and_empty_projection_match(
+        #[case] row_range: Option<Range<u64>>,
+        #[case] partition_range: Option<Range<u64>>,
+        #[case] partition_selection: VortexResult<Selection>,
+        #[case] limit: Option<u64>,
+        #[case] expected_ids: Vec<usize>,
+        #[case] expected_values: Vec<i32>,
+        #[case] expected_partition_count: Precision<usize>,
+    ) -> VortexResult<()> {
+        let partition_selection = partition_selection?;
         let runtime = SingleThreadRuntime::default();
         let session = session_with_handle(runtime.handle());
         // 6 rows split into 3 partitions of 2 rows each:
@@ -810,134 +911,86 @@ mod tests {
         let source = LayoutReaderDataSource::new(Arc::new(TestLayoutReader::new(6)), session)
             .with_split_max_row_count(2);
 
-        let empty_proj = vortex_array::expr::pack(
-            std::iter::empty::<(&str, vortex_array::expr::Expression)>(),
-            vortex_array::dtype::Nullability::NonNullable,
+        for (is_empty_proj, projection) in [(false, root()), (true, empty_projection())] {
+            let scan = runtime.block_on(source.scan(ScanRequest {
+                projection,
+                row_range: row_range.clone(),
+                partition_range: partition_range.clone(),
+                partition_selection: partition_selection.clone(),
+                limit,
+                ..Default::default()
+            }))?;
+            assert_eq!(scan.partition_count(), expected_partition_count);
+
+            let parts = runtime.block_on(scan.partitions().try_collect::<Vec<_>>())?;
+            let ids: Vec<usize> = parts.iter().map(|p| p.index()).collect();
+            assert_eq!(ids, expected_ids);
+
+            if is_empty_proj {
+                let mut rows = 0usize;
+                for part in parts {
+                    for array in runtime.block_on(part.execute()?.try_collect::<Vec<_>>())? {
+                        rows += array.len();
+                    }
+                }
+                assert_eq!(rows, expected_values.len());
+            } else {
+                let mut values = Vec::new();
+                for part in parts {
+                    values.extend(collect_scan_values(
+                        runtime.block_on_stream(part.execute()?),
+                    )?);
+                }
+                assert_eq!(values, expected_values);
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn empty_projection_single_split_reports_exact_partition_count() -> VortexResult<()> {
+        let runtime = SingleThreadRuntime::default();
+        let source = LayoutReaderDataSource::new(
+            Arc::new(TestLayoutReader::new(6)),
+            session_with_handle(runtime.handle()),
         );
-
-        // Exclude partition 0 with limit 2: only eligible partitions count toward limit,
-        // so partition 1 ([2, 3]) is returned.
-        let exclude_zero =
-            Selection::ExcludeByIndex(StrictSortedBuffer::try_new(Buffer::from_iter([0u64]))?);
-        let normal_scan = runtime.block_on(source.scan(ScanRequest {
-            partition_selection: exclude_zero.clone(),
-            limit: Some(2),
+        let scan = runtime.block_on(source.scan(ScanRequest {
+            projection: empty_projection(),
             ..Default::default()
         }))?;
-        let normal_parts = runtime.block_on(normal_scan.partitions().try_collect::<Vec<_>>())?;
-        assert_eq!(normal_parts.len(), 1);
-        assert_eq!(normal_parts[0].index(), 1);
-        let normal_vals = collect_scan_values(
-            runtime.block_on_stream(normal_parts.into_iter().next().unwrap().execute()?),
-        )?;
-        assert_eq!(normal_vals, vec![2, 3]);
+        assert_eq!(scan.partition_count(), Precision::exact(1usize));
+        Ok(())
+    }
 
-        let empty_scan = runtime.block_on(source.scan(ScanRequest {
-            projection: empty_proj.clone(),
-            partition_selection: exclude_zero,
-            limit: Some(2),
-            ..Default::default()
-        }))?;
-        let empty_parts = runtime.block_on(empty_scan.partitions().try_collect::<Vec<_>>())?;
-        assert_eq!(empty_parts.len(), 1);
-        assert_eq!(empty_parts[0].index(), 1);
-        let empty_rows: usize = runtime
-            .block_on(
-                empty_parts
-                    .into_iter()
-                    .next()
-                    .unwrap()
-                    .execute()?
-                    .try_collect::<Vec<_>>(),
-            )?
-            .iter()
-            .map(|a| a.len())
-            .sum();
-        assert_eq!(empty_rows, 2);
+    #[test]
+    fn empty_projection_discovery_and_replay_match() -> VortexResult<()> {
+        let runtime = SingleThreadRuntime::default();
+        let source = LayoutReaderDataSource::new(
+            Arc::new(TestLayoutReader::new(6)),
+            session_with_handle(runtime.handle()),
+        )
+        .with_split_max_row_count(2);
 
-        // Empty include returns 0 partitions on both normal and empty-projection paths.
-        let empty_include =
-            Selection::IncludeByIndex(StrictSortedBuffer::try_new(Buffer::empty())?);
-        let normal_empty = runtime.block_on(source.scan(ScanRequest {
-            partition_selection: empty_include.clone(),
-            ..Default::default()
-        }))?;
-        assert!(
-            runtime
-                .block_on(normal_empty.partitions().try_collect::<Vec<_>>())?
-                .is_empty()
-        );
-        let proj_empty = runtime.block_on(source.scan(ScanRequest {
-            projection: empty_proj.clone(),
-            partition_selection: empty_include,
-            ..Default::default()
-        }))?;
-        assert!(
-            runtime
-                .block_on(proj_empty.partitions().try_collect::<Vec<_>>())?
-                .is_empty()
-        );
-
-        // Roaring include + partition_range intersection selects partition 2 ([4, 5]).
-        let mut roaring = roaring::RoaringTreemap::new();
-        roaring.insert(0);
-        roaring.insert(2);
-        let normal_roaring = runtime.block_on(source.scan(ScanRequest {
-            partition_range: Some(1..3),
-            partition_selection: Selection::IncludeRoaring(roaring.clone()),
-            ..Default::default()
-        }))?;
-        let parts = runtime.block_on(normal_roaring.partitions().try_collect::<Vec<_>>())?;
-        assert_eq!(parts.len(), 1);
-        assert_eq!(parts[0].index(), 2);
-        let vals = collect_scan_values(
-            runtime.block_on_stream(parts.into_iter().next().unwrap().execute()?),
-        )?;
-        assert_eq!(vals, vec![4, 5]);
-
-        let empty_roaring = runtime.block_on(source.scan(ScanRequest {
-            projection: empty_proj.clone(),
-            partition_range: Some(1..3),
-            partition_selection: Selection::IncludeRoaring(roaring),
-            ..Default::default()
-        }))?;
-        let parts = runtime.block_on(empty_roaring.partitions().try_collect::<Vec<_>>())?;
-        assert_eq!(parts.len(), 1);
-        assert_eq!(parts[0].index(), 2);
-
-        // Row-range scans preserve absolute split-grid partition indices.
-        let range_scan = runtime.block_on(source.scan(ScanRequest {
-            row_range: Some(2..6),
-            partition_selection: Selection::IncludeByIndex(StrictSortedBuffer::try_new(
-                Buffer::from_iter([1u64]),
-            )?),
-            ..Default::default()
-        }))?;
-        let parts = runtime.block_on(range_scan.partitions().try_collect::<Vec<_>>())?;
-        assert_eq!(parts.len(), 1);
-        assert_eq!(parts[0].index(), 1);
-        let vals = collect_scan_values(
-            runtime.block_on_stream(parts.into_iter().next().unwrap().execute()?),
-        )?;
-        assert_eq!(vals, vec![2, 3]);
-
-        // Empty-projection discovery and partition replay emit identical split-grid partitions.
         let discovered = runtime.block_on(source.scan(ScanRequest {
-            projection: empty_proj.clone(),
+            projection: empty_projection(),
             ..Default::default()
         }))?;
+        assert_eq!(discovered.partition_count(), Precision::exact(3usize));
         let discovered_parts = runtime.block_on(discovered.partitions().try_collect::<Vec<_>>())?;
         let discovered_ids: Vec<usize> = discovered_parts.iter().map(|p| p.index()).collect();
         assert_eq!(discovered_ids, vec![0, 1, 2]);
+
         let mut replayed_rows = 0usize;
         for id in discovered_ids {
             let replay = runtime.block_on(source.scan(ScanRequest {
-                projection: empty_proj.clone(),
+                projection: empty_projection(),
                 partition_selection: Selection::IncludeByIndex(StrictSortedBuffer::try_new(
                     Buffer::from_iter([id as u64]),
                 )?),
                 ..Default::default()
             }))?;
+            assert_eq!(replay.partition_count(), Precision::exact(1usize));
             for part in runtime.block_on(replay.partitions().try_collect::<Vec<_>>())? {
                 for array in runtime.block_on(part.execute()?.try_collect::<Vec<_>>())? {
                     replayed_rows += array.len();
@@ -945,8 +998,12 @@ mod tests {
             }
         }
         assert_eq!(replayed_rows, 6);
+        Ok(())
+    }
 
-        // Zero split_max_row_count is rejected instead of looping.
+    #[test]
+    fn zero_split_max_row_count_is_rejected() {
+        let runtime = SingleThreadRuntime::default();
         let zero_split = LayoutReaderDataSource::new(
             Arc::new(TestLayoutReader::new(6)),
             session_with_handle(runtime.handle()),
@@ -957,8 +1014,6 @@ mod tests {
                 .block_on(zero_split.scan(ScanRequest::default()))
                 .is_err()
         );
-
-        Ok(())
     }
 
     #[test]
@@ -969,18 +1024,15 @@ mod tests {
             session_with_handle(runtime.handle()),
         )
         .with_split_max_row_count(2);
-        let empty_proj = vortex_array::expr::pack(
-            std::iter::empty::<(&str, vortex_array::expr::Expression)>(),
-            vortex_array::dtype::Nullability::NonNullable,
-        );
 
-        for proj in [empty_proj, root()] {
+        for proj in [empty_projection(), root()] {
             let nonexistent = runtime.block_on(source.scan(ScanRequest {
                 projection: proj.clone(),
                 row_range: Some(0..8),
                 partition_range: Some(3..4),
                 ..Default::default()
             }))?;
+            assert_eq!(nonexistent.partition_count(), Precision::exact(0usize));
             assert!(
                 runtime
                     .block_on(nonexistent.partitions().try_collect::<Vec<_>>())?
@@ -993,18 +1045,14 @@ mod tests {
                 partition_range: Some(2..4),
                 ..Default::default()
             }))?;
+            assert_eq!(overlapping_end.partition_count(), Precision::exact(1usize));
             let parts = runtime.block_on(overlapping_end.partitions().try_collect::<Vec<_>>())?;
-            assert_eq!(parts.len(), 1);
-            assert_eq!(parts[0].index(), 2);
+            let [part]: [_; 1] = parts
+                .try_into()
+                .map_err(|p: Vec<_>| vortex_err!("expected 1 partition, got {}", p.len()))?;
+            assert_eq!(part.index(), 2);
             let rows: usize = runtime
-                .block_on(
-                    parts
-                        .into_iter()
-                        .next()
-                        .unwrap()
-                        .execute()?
-                        .try_collect::<Vec<_>>(),
-                )?
+                .block_on(part.execute()?.try_collect::<Vec<_>>())?
                 .iter()
                 .map(|a| a.len())
                 .sum();

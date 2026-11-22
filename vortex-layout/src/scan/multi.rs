@@ -86,6 +86,9 @@ pub trait LayoutReaderFactory: 'static + Send + Sync {
 /// to `concurrency` file opens run in parallel as spawned tasks on the session runtime. Once
 /// opened, each reader yields a single partition covering its full row range; internal I/O
 /// pipelining and chunking are handled by [`ScanBuilder`].
+///
+/// Partition `i` always corresponds to the `i`-th child in this source, regardless of async open
+/// completion order or earlier children pruned via `Ok(None)`.
 #[derive(Clone)]
 pub struct MultiLayoutDataSource {
     dtype: DType,
@@ -515,11 +518,6 @@ fn reader_partition(
     let row_count = reader.row_count();
     let row_range = request.row_range.clone().unwrap_or(0..row_count);
 
-    let partition_idx_u64: u64 = partition_idx as u64;
-    if !request.includes_partition(partition_idx_u64) {
-        return stream::empty().boxed();
-    }
-
     // Check file-level pruning: if the filter can be proven false for the entire row range
     // using file-level statistics, skip this reader entirely.
     if let Ok(Some(filter)) = &request.filter {
@@ -892,11 +890,11 @@ mod tests {
             ..Default::default()
         }))?;
         let partitions = runtime.block_on(scan.partitions().try_collect::<Vec<_>>())?;
-        assert_eq!(partitions.len(), 1);
-        assert_eq!(partitions[0].index(), 2);
-        let values = collect_scan_values(
-            runtime.block_on_stream(partitions.into_iter().next().unwrap().execute()?),
-        )?;
+        let [partition]: [_; 1] = partitions
+            .try_into()
+            .map_err(|parts: Vec<_>| vortex_err!("expected 1 partition, got {}", parts.len()))?;
+        assert_eq!(partition.index(), 2);
+        let values = collect_scan_values(runtime.block_on_stream(partition.execute()?))?;
         assert_eq!(values, vec![20, 21]);
 
         // Empty IncludeByIndex returns no partitions.
