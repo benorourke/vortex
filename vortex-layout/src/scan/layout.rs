@@ -946,9 +946,35 @@ mod tests {
         }
         assert_eq!(replayed_rows, 6);
 
-        // Requesting a row_range beyond the file extent clamps to 0..total_rows so nonexistent
-        // partitions are never emitted and the last partition only covers real file rows.
-        for proj in [empty_proj.clone(), root()] {
+        // Zero split_max_row_count is rejected instead of looping.
+        let zero_split = LayoutReaderDataSource::new(
+            Arc::new(TestLayoutReader::new(6)),
+            session_with_handle(runtime.handle()),
+        )
+        .with_split_max_row_count(0);
+        assert!(
+            runtime
+                .block_on(zero_split.scan(ScanRequest::default()))
+                .is_err()
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn row_range_beyond_file_extent_is_clamped_before_cursor() -> VortexResult<()> {
+        let runtime = SingleThreadRuntime::default();
+        let source = LayoutReaderDataSource::new(
+            Arc::new(TestLayoutReader::new(6)),
+            session_with_handle(runtime.handle()),
+        )
+        .with_split_max_row_count(2);
+        let empty_proj = vortex_array::expr::pack(
+            std::iter::empty::<(&str, vortex_array::expr::Expression)>(),
+            vortex_array::dtype::Nullability::NonNullable,
+        );
+
+        for proj in [empty_proj, root()] {
             let nonexistent = runtime.block_on(source.scan(ScanRequest {
                 projection: proj.clone(),
                 row_range: Some(0..8),
@@ -984,18 +1010,6 @@ mod tests {
                 .sum();
             assert_eq!(rows, 2);
         }
-
-        // Zero split_max_row_count is rejected instead of looping.
-        let zero_split = LayoutReaderDataSource::new(
-            Arc::new(TestLayoutReader::new(6)),
-            session_with_handle(runtime.handle()),
-        )
-        .with_split_max_row_count(0);
-        assert!(
-            runtime
-                .block_on(zero_split.scan(ScanRequest::default()))
-                .is_err()
-        );
 
         Ok(())
     }
