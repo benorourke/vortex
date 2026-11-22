@@ -16,7 +16,6 @@ use vortex::buffer::Buffer;
 use vortex::encodings::zstd::ZstdBuffers;
 use vortex::encodings::zstd::ZstdBuffersArray;
 use vortex::error::VortexResult;
-use vortex::error::vortex_ensure_eq;
 use vortex::error::vortex_err;
 use vortex_cuda_driver::CudaSlice;
 use vortex_cuda_driver::DevicePtr;
@@ -203,17 +202,6 @@ pub(super) fn validate_nvcomp_decompress_results(
     actual_sizes: &[usize],
     statuses: &[nvcompStatus_t],
 ) -> VortexResult<()> {
-    vortex_ensure_eq!(
-        statuses.len(),
-        expected_sizes.len(),
-        "nvcomp status count mismatch"
-    );
-    vortex_ensure_eq!(
-        actual_sizes.len(),
-        expected_sizes.len(),
-        "nvcomp actual output size count mismatch"
-    );
-
     for (idx, ((&status, &actual), &expected)) in statuses
         .iter()
         .zip(actual_sizes.iter())
@@ -241,29 +229,19 @@ pub(super) fn validate_nvcomp_decompress_results(
 }
 
 // This performs D2H to retrieve the lengths and status arrays.
-pub(super) async fn copy_decompress_results_to_host(
+pub(super) async fn validate_decompress_results(
+    expected_sizes: &[usize],
     device_actual_sizes: CudaSlice<usize>,
     device_statuses: CudaSlice<nvcompStatus_t>,
-) -> VortexResult<(Buffer<usize>, Buffer<nvcompStatus_t>)> {
+) -> VortexResult<()> {
     let actual_sizes_fut =
         CudaDeviceBuffer::new(device_actual_sizes)?.copy_to_host(Alignment::of::<usize>())?;
     let statuses_fut =
         CudaDeviceBuffer::new(device_statuses)?.copy_to_host(Alignment::of::<nvcompStatus_t>())?;
     let (actual_sizes_host, statuses_host) = futures::try_join!(actual_sizes_fut, statuses_fut)?;
 
-    Ok((
-        Buffer::<usize>::from_byte_buffer(actual_sizes_host),
-        Buffer::<nvcompStatus_t>::from_byte_buffer(statuses_host),
-    ))
-}
-
-async fn validate_decompress_results(
-    expected_sizes: &[usize],
-    device_actual_sizes: CudaSlice<usize>,
-    device_statuses: CudaSlice<nvcompStatus_t>,
-) -> VortexResult<()> {
-    let (actual_sizes, statuses) =
-        copy_decompress_results_to_host(device_actual_sizes, device_statuses).await?;
+    let actual_sizes = Buffer::<usize>::from_byte_buffer(actual_sizes_host);
+    let statuses = Buffer::<nvcompStatus_t>::from_byte_buffer(statuses_host);
 
     validate_nvcomp_decompress_results(expected_sizes, actual_sizes.as_slice(), statuses.as_slice())
 }
