@@ -125,6 +125,10 @@ impl Planner for ChunkPlanner {
     fn compute(&mut self) -> VortexResult<PlannerOutput> {
         let kept = self.kept.as_ref().map(|kept| (kept, self.rows.start));
         for chunk in self.chunks.by_ref() {
+            let has_selected = self.selection.row_count_in_range(&chunk) != 0;
+            if has_selected && let Some(recorder) = &self.scan.recorder {
+                recorder.attempt_file_scan();
+            }
             let scope = WorkScope {
                 file_ordinal: 0,
                 rows: chunk,
@@ -132,6 +136,13 @@ impl Planner for ChunkPlanner {
             if let Some((scope, planner)) = plan_selection(&self.scan, scope, &self.selection, kept)
             {
                 return Ok(PlannerOutput::Spawn(scope, planner));
+            }
+            if has_selected
+                && self.kept.is_some()
+                && let Some(recorder) = &self.scan.recorder
+            {
+                recorder.attempt_split();
+                recorder.prune_split();
             }
         }
         Ok(PlannerOutput::Done)

@@ -7,6 +7,7 @@ use std::sync::atomic::AtomicI32;
 use std::sync::atomic::Ordering;
 
 use futures::StreamExt;
+use futures::TryStreamExt;
 use rstest::rstest;
 use vortex_array::IntoArray;
 use vortex_array::MaskFuture;
@@ -17,6 +18,7 @@ use vortex_array::expr::and;
 use vortex_array::expr::col;
 use vortex_array::expr::dynamic;
 use vortex_array::expr::eq;
+use vortex_array::expr::gt;
 use vortex_array::expr::gt_eq;
 use vortex_array::expr::lit;
 use vortex_array::expr::lt_eq;
@@ -25,19 +27,24 @@ use vortex_array::stream::ArrayStreamExt;
 use vortex_buffer::ByteBufferMut;
 use vortex_buffer::buffer;
 use vortex_error::VortexResult;
+use vortex_io::runtime::tokio::TokioRuntime;
 use vortex_layout::layouts::chunked::writer::ChunkedLayoutStrategy;
 use vortex_layout::layouts::flat::writer::FlatLayoutStrategy;
 use vortex_layout::layouts::row_idx::row_idx;
 use vortex_layout::layouts::table::TableStrategy;
 use vortex_layout::layouts::zoned::writer::ZonedLayoutOptions;
 use vortex_layout::layouts::zoned::writer::ZonedStrategy;
+use vortex_layout::scan::layout::LayoutReaderDataSource;
 use vortex_layout::scan::metrics::ScanMetrics;
 use vortex_layout::scan::metrics::ScanUsage;
 use vortex_layout::scan::split_by::SplitBy;
+use vortex_layout::scan::v2::ScanBuilder as V2ScanBuilder;
 use vortex_mask::Mask;
 use vortex_metrics::DefaultMetricsRegistry;
 use vortex_metrics::MetricValue;
 use vortex_metrics::MetricsRegistry;
+use vortex_scan::DataSource;
+use vortex_scan::ScanRequest;
 use vortex_scan::selection::Selection;
 use vortex_scan::strict_sorted_buffer::StrictSortedBuffer;
 
@@ -482,5 +489,186 @@ async fn test_file_usage_counts_segment_reads() -> VortexResult<()> {
     assert_eq!(after.splits_attempted, 0);
     assert!(after.segments_requested > 0);
     assert_eq!(second.snapshot(), scanned);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_data_source_usage_normal_pruned_unused_and_repeated() -> VortexResult<()> {
+    let file = scan_file([[0, 1], [10, 11], [90, 91], [100, 101]]).await?;
+    let usage = Arc::new(ScanUsage::default());
+    let source = file.clone().with_usage(Arc::clone(&usage)).data_source()?;
+
+    // Unused partitions must not record execution counters.
+    let unused_scan = source.scan(ScanRequest::default()).await?;
+    let unused_parts: Vec<_> = unused_scan.partitions().try_collect().await?;
+    assert!(!unused_parts.is_empty());
+    drop(unused_parts);
+    assert_usage(&usage, [0, 0, 0, 0, 0]);
+
+    // Normal scan executes and records file + split attempts and segment reads.
+    let scan = source.scan(ScanRequest::default()).await?;
+    let mut rows = 0;
+    let parts: Vec<_> = scan.partitions().try_collect().await?;
+    for part in parts {
+        let arrays: Vec<_> = part.execute()?.try_collect().await?;
+        rows += arrays.iter().map(|a| a.len()).sum::<usize>();
+    }
+    assert_eq!(rows, 8);
+    let after_first = usage.snapshot();
+    assert_eq!(after_first.file_scans_attempted, 1);
+    assert_eq!(after_first.file_scans_pruned, 0);
+    assert!(after_first.splits_attempted >= 1);
+    assert!(after_first.segments_requested > 0);
+
+    // Whole-file pruning records both file_scans_attempted and file_scans_pruned.
+    let pruned_scan = source
+        .scan(ScanRequest {
+            filter: Some(gt(col("value"), lit(1000i32))),
+            ..Default::default()
+        })
+        .await?;
+    let pruned_parts: Vec<_> = pruned_scan.partitions().try_collect().await?;
+    for part in pruned_parts {
+        let arrays: Vec<_> = part.execute()?.try_collect().await?;
+        assert!(arrays.is_empty());
+    }
+    let after_prune = usage.snapshot().since(&after_first);
+    assert_eq!(after_prune.file_scans_attempted, 1);
+    assert_eq!(after_prune.file_scans_pruned, 1);
+
+    // Repeated execution increments file_scans_attempted once more.
+    let before_repeat = usage.snapshot();
+    let repeat_scan = source.scan(ScanRequest::default()).await?;
+    let repeat_parts: Vec<_> = repeat_scan.partitions().try_collect().await?;
+    for part in repeat_parts {
+        let _arrays: Vec<_> = part.execute()?.try_collect().await?;
+    }
+    let after_repeat = usage.snapshot().since(&before_repeat);
+    assert_eq!(after_repeat.file_scans_attempted, 1);
+    assert!(after_repeat.splits_attempted >= 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_data_source_multi_partition_shares_file_attempt_guard() -> VortexResult<()> {
+    let file = scan_file([[0, 1], [10, 11], [90, 91], [100, 101]]).await?;
+    let usage = Arc::new(ScanUsage::default());
+    let registry = Arc::new(DefaultMetricsRegistry::default());
+    let source = LayoutReaderDataSource::new(file.layout_reader()?, SESSION.clone())
+        .with_split_max_row_count(2)
+        .with_usage(Arc::clone(&usage))
+        .with_metrics_registry(Arc::clone(&registry) as Arc<dyn MetricsRegistry>);
+
+    let scan = source.scan(ScanRequest::default()).await?;
+    let parts: Vec<_> = scan.partitions().try_collect().await?;
+    assert_eq!(parts.len(), 4);
+    for part in parts {
+        let _arrays: Vec<_> = part.execute()?.try_collect().await?;
+    }
+
+    assert_usage(&usage, [4, 0, 0, 0, 1]);
+    assert_registry(&registry, [4, 0, 0, 0, 1]);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_equivalent_scan_entry_points_record_usage() -> VortexResult<()> {
+    use crate::v2::ScanDriver;
+
+    let file = scan_file([[0, 1], [10, 11], [90, 91], [100, 101]]).await?;
+
+    // Normal full scan across V1, DataSource, and V2.
+    let v1_usage = Arc::new(ScanUsage::default());
+    let v1_rows = file
+        .clone()
+        .with_usage(Arc::clone(&v1_usage))
+        .scan()?
+        .into_array_stream()?
+        .read_all()
+        .await?
+        .len();
+    assert_eq!(v1_rows, 8);
+
+    let ds_usage = Arc::new(ScanUsage::default());
+    let ds = file
+        .clone()
+        .with_usage(Arc::clone(&ds_usage))
+        .data_source()?;
+    let ds_scan = ds.scan(ScanRequest::default()).await?;
+    let mut ds_rows = 0;
+    for part in ds_scan.partitions().try_collect::<Vec<_>>().await? {
+        for array in part.execute()?.try_collect::<Vec<_>>().await? {
+            ds_rows += array.len();
+        }
+    }
+    assert_eq!(ds_rows, 8);
+
+    let v2_usage = Arc::new(ScanUsage::default());
+    let v2_file = file.clone().with_usage(Arc::clone(&v2_usage)).scan_file();
+    let v2_arrays: Vec<_> = ScanDriver::new(TokioRuntime::current(), 2, true)
+        .run(V2ScanBuilder::new(SESSION.clone(), v2_file))
+        .try_collect()
+        .await?;
+    let v2_rows: usize = v2_arrays.iter().map(|a| a.len()).sum();
+    assert_eq!(v2_rows, 8);
+
+    for snap in [
+        v1_usage.snapshot(),
+        ds_usage.snapshot(),
+        v2_usage.snapshot(),
+    ] {
+        assert_eq!(snap.file_scans_attempted, 1);
+        assert_eq!(snap.file_scans_pruned, 0);
+        assert!(snap.splits_attempted >= 1);
+        assert!(snap.segments_requested > 0);
+    }
+
+    // Whole-file pruning across V1, DataSource, and V2.
+    let prune_expr = gt(col("value"), lit(1000i32));
+    let bound_prune = prune_expr.clone().bind(file.dtype())?;
+
+    let v1_pruned = Arc::new(ScanUsage::default());
+    let v1_res = file
+        .clone()
+        .with_usage(Arc::clone(&v1_pruned))
+        .scan()?
+        .with_filter(bound_prune.clone())
+        .into_array_stream()?
+        .read_all()
+        .await?;
+    assert_eq!(v1_res.len(), 0);
+
+    let ds_pruned = Arc::new(ScanUsage::default());
+    let ds = file
+        .clone()
+        .with_usage(Arc::clone(&ds_pruned))
+        .data_source()?;
+    let ds_scan = ds
+        .scan(ScanRequest {
+            filter: Some(prune_expr),
+            ..Default::default()
+        })
+        .await?;
+    for part in ds_scan.partitions().try_collect::<Vec<_>>().await? {
+        assert!(part.execute()?.try_collect::<Vec<_>>().await?.is_empty());
+    }
+
+    let v2_pruned = Arc::new(ScanUsage::default());
+    let v2_file = file.clone().with_usage(Arc::clone(&v2_pruned)).scan_file();
+    let v2_arrays: Vec<_> = ScanDriver::new(TokioRuntime::current(), 2, true)
+        .run(V2ScanBuilder::new(SESSION.clone(), v2_file).with_some_filter(Some(bound_prune)))
+        .try_collect()
+        .await?;
+    assert!(v2_arrays.is_empty());
+
+    for snap in [
+        v1_pruned.snapshot(),
+        ds_pruned.snapshot(),
+        v2_pruned.snapshot(),
+    ] {
+        assert_eq!(snap.file_scans_attempted, 1);
+        assert_eq!(snap.file_scans_pruned, 1);
+    }
+
     Ok(())
 }

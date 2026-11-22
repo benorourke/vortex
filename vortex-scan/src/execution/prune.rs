@@ -107,6 +107,11 @@ impl Planner for PrunePlanner {
         }
         if !self.announced {
             self.announced = true;
+            if let Some(recorder) = &self.scan.recorder
+                && self.scan.selection.row_count_in_range(&self.rows) != 0
+            {
+                recorder.attempt_file_scan();
+            }
             // A pruning plan whose zones an earlier scan of the file pruned compiles to its kept
             // result and lists no segment, so only unpruned plans prefetch their zone maps.
             let segments = segments_read(
@@ -156,6 +161,12 @@ impl Planner for PrunePlanner {
             self.pruned = true;
         }
         if self.mask.all_false() {
+            if self.pruned
+                && let Some(recorder) = &self.scan.recorder
+                && self.scan.selection.row_count_in_range(&self.rows) != 0
+            {
+                recorder.prune_file();
+            }
             self.done = true;
             return Ok(PlannerOutput::Done);
         }

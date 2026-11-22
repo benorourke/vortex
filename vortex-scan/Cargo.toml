@@ -33,6 +33,7 @@ vortex-error = { workspace = true }
 vortex-expr = { workspace = true }
 vortex-io = { workspace = true }
 vortex-mask = { workspace = true }
+vortex-metrics = { workspace = true }
 vortex-session = { workspace = true }
 vortex-utils = { workspace = true }
 

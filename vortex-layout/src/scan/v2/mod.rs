@@ -26,6 +26,8 @@ use vortex_scan::strict_sorted_buffer::StrictSortedBuffer;
 use vortex_session::VortexSession;
 
 use crate::LayoutRef;
+use crate::scan::metrics::ScanMetrics;
+use crate::scan::metrics::ScanUsage;
 use crate::segments::SegmentSource;
 
 // Match the scan executor's row grid so byte partitions and scan chunks stay aligned.
@@ -58,6 +60,8 @@ pub struct ScanFile {
     pub segments: Arc<dyn SegmentSource>,
     /// State shared by every scan of this file, or `None` to rebuild it for each scan.
     pub cache: Option<ScanCache>,
+    /// Caller-owned usage sink that scans of this file record into.
+    pub usage: Option<Arc<ScanUsage>>,
 }
 
 impl From<ScanFile> for ScanInput {
@@ -68,6 +72,7 @@ impl From<ScanFile> for ScanInput {
             locations: file.locations,
             segments: file.segments,
             cache: file.cache,
+            usage: file.usage,
         }
     }
 }
@@ -82,11 +87,14 @@ pub struct ScanBuilder {
     selection: Selection,
     row_offset: u64,
     skip_unselective_dynamic: bool,
+    usage: Option<Arc<ScanUsage>>,
+    metrics: Option<ScanMetrics>,
 }
 
 impl ScanBuilder {
     /// Creates a scan over the file's layout and segment source.
     pub fn new(session: VortexSession, file: ScanFile) -> Self {
+        let usage = file.usage.clone();
         Self {
             projection: BoundExpression::new_root(file.layout.dtype().clone()),
             filter: None,
@@ -96,6 +104,8 @@ impl ScanBuilder {
             selection: Selection::default(),
             row_offset: 0,
             skip_unselective_dynamic: false,
+            usage,
+            metrics: None,
         }
     }
 
@@ -156,6 +166,28 @@ impl ScanBuilder {
         self
     }
 
+    /// Records resource usage for this scan into `usage`.
+    pub fn with_usage(self, usage: Arc<ScanUsage>) -> Self {
+        self.with_some_usage(Some(usage))
+    }
+
+    /// Records resource usage for this scan into `usage`, or clears it.
+    pub fn with_some_usage(mut self, usage: Option<Arc<ScanUsage>>) -> Self {
+        self.usage = usage;
+        self
+    }
+
+    /// Exports scan events to `metrics`.
+    pub fn with_scan_metrics(self, metrics: ScanMetrics) -> Self {
+        self.with_some_scan_metrics(Some(metrics))
+    }
+
+    /// Exports scan events to `metrics`, or clears them.
+    pub fn with_some_scan_metrics(mut self, metrics: Option<ScanMetrics>) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
     /// Lowers the native layout and prepares the scan without reading payloads.
     pub fn prepare(self) -> VortexResult<PreparedScan> {
         self.into_scan_builder().prepare()
@@ -167,7 +199,9 @@ impl ScanBuilder {
             .with_some_filter(self.filter)
             .with_selection(self.selection)
             .with_row_offset(self.row_offset)
-            .with_skip_unselective_dynamic(self.skip_unselective_dynamic);
+            .with_skip_unselective_dynamic(self.skip_unselective_dynamic)
+            .with_some_usage(self.usage)
+            .with_some_scan_metrics(self.metrics);
         if let Some(rows) = self.row_range {
             builder = builder.with_row_range(rows);
         }

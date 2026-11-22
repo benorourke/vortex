@@ -14,6 +14,10 @@ use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::ChunkedArray;
 use vortex_array::arrays::StructArray;
 use vortex_array::arrays::VarBinArray;
+use vortex_array::expr::col;
+use vortex_array::expr::eq;
+use vortex_array::expr::gt;
+use vortex_array::expr::lit;
 use vortex_arrow::ArrowScanExt;
 use vortex_arrow::ArrowSessionExt;
 use vortex_arrow::ExecuteArrowExt;
@@ -22,8 +26,12 @@ use vortex_buffer::buffer;
 use vortex_error::VortexResult;
 use vortex_io::runtime::tokio::TokioRuntime;
 use vortex_io::session::RuntimeSession;
+use vortex_layout::scan::metrics::ScanMetrics;
+use vortex_layout::scan::metrics::ScanUsage;
 use vortex_layout::scan::v2::ScanBuilder;
 use vortex_layout::session::LayoutSession;
+use vortex_metrics::DefaultMetricsRegistry;
+use vortex_metrics::MetricsRegistry;
 use vortex_session::VortexSession;
 
 use super::ScanDriver;
@@ -91,5 +99,105 @@ async fn record_batches_match_arrays() -> VortexResult<()> {
 
     assert_eq!(derived, expected);
     assert_eq!(given, expected);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn v2_scan_records_usage_and_metrics() -> VortexResult<()> {
+    let file = file().await?;
+    let usage = Arc::new(ScanUsage::default());
+    let registry = Arc::new(DefaultMetricsRegistry::default());
+    let metrics = ScanMetrics::new(registry.as_ref());
+    let tracked = file.clone().with_usage(Arc::clone(&usage));
+
+    // Unpolled scan stream must not record file or split execution events.
+    let unpolled = driver().run(
+        ScanBuilder::new(SESSION.clone(), tracked.scan_file()).with_scan_metrics(metrics.clone()),
+    );
+    drop(unpolled);
+    let before = usage.snapshot();
+    assert_eq!(before.file_scans_attempted, 0);
+    assert_eq!(before.splits_attempted, 0);
+
+    // Normal V2 scan records file attempt, split attempts, and segment reads.
+    let arrays: Vec<ArrayRef> = driver()
+        .run(
+            ScanBuilder::new(SESSION.clone(), tracked.scan_file())
+                .with_scan_metrics(metrics.clone()),
+        )
+        .try_collect()
+        .await?;
+    assert_eq!(arrays.iter().map(|a| a.len()).sum::<usize>(), 32);
+    let after_normal = usage.snapshot();
+    assert_eq!(after_normal.file_scans_attempted, 1);
+    assert_eq!(after_normal.file_scans_pruned, 0);
+    assert!(after_normal.splits_attempted >= 1);
+    assert!(after_normal.segments_requested > 0);
+    assert!(after_normal.bytes_requested >= after_normal.segments_requested);
+
+    // Whole-file pruning via zone maps records file_scans_pruned.
+    let pruned: Vec<ArrayRef> = driver()
+        .run(
+            ScanBuilder::new(SESSION.clone(), tracked.scan_file())
+                .with_some_filter(Some(gt(col("numbers"), lit(1000i32)).bind(file.dtype())?))
+                .with_scan_metrics(metrics.clone()),
+        )
+        .try_collect()
+        .await?;
+    assert!(pruned.is_empty());
+    let after_prune = usage.snapshot().since(&after_normal);
+    assert_eq!(after_prune.file_scans_attempted, 1);
+    assert_eq!(after_prune.file_scans_pruned, 1);
+
+    // Predicate that survives zone maps but matches no rows records empty_after_predicate.
+    let before_pred = usage.snapshot();
+    let empty: Vec<ArrayRef> = driver()
+        .run(
+            ScanBuilder::new(SESSION.clone(), tracked.scan_file())
+                .with_some_filter(Some(eq(col("strings"), lit("missing")).bind(file.dtype())?))
+                .with_scan_metrics(metrics.clone()),
+        )
+        .try_collect()
+        .await?;
+    assert!(empty.is_empty());
+    let after_pred = usage.snapshot().since(&before_pred);
+    assert_eq!(after_pred.file_scans_attempted, 1);
+    assert!(
+        after_pred.file_scans_pruned == 1 || after_pred.splits_empty_after_predicate >= 1,
+        "expected either file pruning or predicate-empty split, got {after_pred:?}"
+    );
+
+    // Repeated execution increments file_scans_attempted again.
+    let before_repeat = usage.snapshot();
+    let _again: Vec<ArrayRef> = driver()
+        .run(
+            ScanBuilder::new(SESSION.clone(), tracked.scan_file())
+                .with_scan_metrics(metrics.clone()),
+        )
+        .try_collect()
+        .await?;
+    let after_repeat = usage.snapshot().since(&before_repeat);
+    assert_eq!(after_repeat.file_scans_attempted, 1);
+    assert!(after_repeat.splits_attempted >= 1);
+
+    // Registry counters stay aligned with ScanUsage.
+    let total = usage.snapshot();
+    let snapshot = registry.snapshot();
+    let counter = |name: &str| {
+        snapshot
+            .iter()
+            .find(|metric| metric.name() == name)
+            .map(|metric| match metric.value() {
+                vortex_metrics::MetricValue::Counter(counter) => counter.value(),
+                _ => panic!("expected counter for {name}"),
+            })
+            .expect("counter registered")
+    };
+    assert_eq!(
+        counter("scan.file_scans.attempted"),
+        total.file_scans_attempted
+    );
+    assert_eq!(counter("scan.file_scans.pruned"), total.file_scans_pruned);
+    assert_eq!(counter("scan.splits.attempted"), total.splits_attempted);
     Ok(())
 }
