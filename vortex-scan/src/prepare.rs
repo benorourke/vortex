@@ -25,9 +25,7 @@ pub use crate::execution::cache::ScanCache;
 pub use crate::execution::cache::WeakScanCache;
 use crate::execution::io::segment_ranges;
 use crate::execution::rows_per_chunk;
-use crate::metrics::ScanMetrics;
 use crate::metrics::ScanRecorder;
-use crate::metrics::ScanUsage;
 use crate::plan::optimize;
 use crate::plan::plan_row_idx_expression;
 use crate::selection::Selection;
@@ -47,15 +45,12 @@ pub struct ScanBuilder {
     selection: Selection,
     row_offset: u64,
     skip_unselective_dynamic: bool,
-    usage: Option<Arc<ScanUsage>>,
-    metrics: Option<ScanMetrics>,
 }
 
 impl ScanBuilder {
     /// Creates a scan over a lazily lowered plan and its byte source.
     pub fn new(session: VortexSession, file: impl Into<ScanInput>) -> Self {
         let file = file.into();
-        let usage = file.usage.clone();
         Self {
             projection: BoundExpression::new_root(file.dtype.clone()),
             filter: None,
@@ -65,8 +60,6 @@ impl ScanBuilder {
             selection: Selection::default(),
             row_offset: 0,
             skip_unselective_dynamic: false,
-            usage,
-            metrics: None,
         }
     }
 
@@ -124,28 +117,6 @@ impl ScanBuilder {
     /// Sets the root row offset used by row-index expressions.
     pub fn with_row_offset(mut self, row_offset: u64) -> Self {
         self.row_offset = row_offset;
-        self
-    }
-
-    /// Records resource usage for this scan into `usage`.
-    pub fn with_usage(self, usage: Arc<ScanUsage>) -> Self {
-        self.with_some_usage(Some(usage))
-    }
-
-    /// Records resource usage for this scan into `usage`, or clears it.
-    pub fn with_some_usage(mut self, usage: Option<Arc<ScanUsage>>) -> Self {
-        self.usage = usage;
-        self
-    }
-
-    /// Exports scan events to `metrics`.
-    pub fn with_scan_metrics(self, metrics: ScanMetrics) -> Self {
-        self.with_some_scan_metrics(Some(metrics))
-    }
-
-    /// Exports scan events to `metrics`, or clears them.
-    pub fn with_some_scan_metrics(mut self, metrics: Option<ScanMetrics>) -> Self {
-        self.metrics = metrics;
         self
     }
 
@@ -215,7 +186,7 @@ impl ScanBuilder {
             None => cache.insert_ranges(segment_ranges(&file.locations)),
         };
         let values = cache.values();
-        let recorder = ScanRecorder::new(self.usage, self.metrics).map(Arc::new);
+        let recorder = ScanRecorder::new(file.usage, None).map(Arc::new);
         Ok(PreparedScan {
             session: self.session,
             rows: self.row_range.unwrap_or(0..row_count),

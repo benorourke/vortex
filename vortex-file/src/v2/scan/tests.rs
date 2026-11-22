@@ -26,12 +26,9 @@ use vortex_buffer::buffer;
 use vortex_error::VortexResult;
 use vortex_io::runtime::tokio::TokioRuntime;
 use vortex_io::session::RuntimeSession;
-use vortex_layout::scan::metrics::ScanMetrics;
 use vortex_layout::scan::metrics::ScanUsage;
 use vortex_layout::scan::v2::ScanBuilder;
 use vortex_layout::session::LayoutSession;
-use vortex_metrics::DefaultMetricsRegistry;
-use vortex_metrics::MetricsRegistry;
 use vortex_session::VortexSession;
 
 use super::ScanDriver;
@@ -103,17 +100,13 @@ async fn record_batches_match_arrays() -> VortexResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn v2_scan_records_usage_and_metrics() -> VortexResult<()> {
+async fn v2_scan_records_usage() -> VortexResult<()> {
     let file = file().await?;
     let usage = Arc::new(ScanUsage::default());
-    let registry = Arc::new(DefaultMetricsRegistry::default());
-    let metrics = ScanMetrics::new(registry.as_ref());
     let tracked = file.clone().with_usage(Arc::clone(&usage));
 
     // Unpolled scan stream must not record file or split execution events.
-    let unpolled = driver().run(
-        ScanBuilder::new(SESSION.clone(), tracked.scan_file()).with_scan_metrics(metrics.clone()),
-    );
+    let unpolled = driver().run(ScanBuilder::new(SESSION.clone(), tracked.scan_file()));
     drop(unpolled);
     let before = usage.snapshot();
     assert_eq!(before.file_scans_attempted, 0);
@@ -121,10 +114,7 @@ async fn v2_scan_records_usage_and_metrics() -> VortexResult<()> {
 
     // Normal V2 scan records file attempt, split attempts, and segment reads.
     let arrays: Vec<ArrayRef> = driver()
-        .run(
-            ScanBuilder::new(SESSION.clone(), tracked.scan_file())
-                .with_scan_metrics(metrics.clone()),
-        )
+        .run(ScanBuilder::new(SESSION.clone(), tracked.scan_file()))
         .try_collect()
         .await?;
     assert_eq!(arrays.iter().map(|a| a.len()).sum::<usize>(), 32);
@@ -139,8 +129,7 @@ async fn v2_scan_records_usage_and_metrics() -> VortexResult<()> {
     let pruned: Vec<ArrayRef> = driver()
         .run(
             ScanBuilder::new(SESSION.clone(), tracked.scan_file())
-                .with_some_filter(Some(gt(col("numbers"), lit(1000i32)).bind(file.dtype())?))
-                .with_scan_metrics(metrics.clone()),
+                .with_some_filter(Some(gt(col("numbers"), lit(1000i32)).bind(file.dtype())?)),
         )
         .try_collect()
         .await?;
@@ -155,8 +144,7 @@ async fn v2_scan_records_usage_and_metrics() -> VortexResult<()> {
     let empty: Vec<ArrayRef> = driver()
         .run(
             ScanBuilder::new(SESSION.clone(), tracked.scan_file())
-                .with_some_filter(Some(eq(col("strings"), lit("b")).bind(file.dtype())?))
-                .with_scan_metrics(metrics.clone()),
+                .with_some_filter(Some(eq(col("strings"), lit("b")).bind(file.dtype())?)),
         )
         .try_collect()
         .await?;
@@ -175,8 +163,7 @@ async fn v2_scan_records_usage_and_metrics() -> VortexResult<()> {
                 .with_row_range(0..1)
                 .with_some_filter(Some(
                     gt(col("numbers"), lit(1_000_000i32)).bind(file.dtype())?,
-                ))
-                .with_scan_metrics(metrics.clone()),
+                )),
         )
         .try_collect()
         .await?;
@@ -190,34 +177,11 @@ async fn v2_scan_records_usage_and_metrics() -> VortexResult<()> {
     // Repeated execution increments file_scans_attempted again.
     let before_repeat = usage.snapshot();
     let _again: Vec<ArrayRef> = driver()
-        .run(
-            ScanBuilder::new(SESSION.clone(), tracked.scan_file())
-                .with_scan_metrics(metrics.clone()),
-        )
+        .run(ScanBuilder::new(SESSION.clone(), tracked.scan_file()))
         .try_collect()
         .await?;
     let after_repeat = usage.snapshot().since(&before_repeat);
     assert_eq!(after_repeat.file_scans_attempted, 1);
     assert!(after_repeat.splits_attempted >= 1);
-
-    // Registry counters stay aligned with ScanUsage.
-    let total = usage.snapshot();
-    let snapshot = registry.snapshot();
-    let counter = |name: &str| {
-        snapshot
-            .iter()
-            .find(|metric| metric.name() == name)
-            .map(|metric| match metric.value() {
-                vortex_metrics::MetricValue::Counter(counter) => counter.value(),
-                _ => panic!("expected counter for {name}"),
-            })
-            .expect("counter registered")
-    };
-    assert_eq!(
-        counter("scan.file_scans.attempted"),
-        total.file_scans_attempted
-    );
-    assert_eq!(counter("scan.file_scans.pruned"), total.file_scans_pruned);
-    assert_eq!(counter("scan.splits.attempted"), total.splits_attempted);
     Ok(())
 }
