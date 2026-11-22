@@ -98,53 +98,20 @@ impl PartitionCursor {
         }
     }
 
+    /// Returns the next selected partition index and its clamped row range.
+    ///
+    /// Skips unselected partition indices linearly over `[next_partition, end_partition)`, which is
+    /// bounded by the number of splits in the scan (1 by default, or `rows / split_size` when
+    /// `with_split_max_row_count` is set).
     fn next_selected(&mut self) -> Option<(usize, Range<u64>)> {
-        if self.next_partition >= self.end_partition {
+        let mut partition = self.next_partition;
+        while partition < self.end_partition && !self.partition_selection.contains(partition) {
+            partition = partition.saturating_add(1);
+        }
+        if partition >= self.end_partition {
+            self.next_partition = self.end_partition;
             return None;
         }
-
-        let partition = match &self.partition_selection {
-            Selection::All => self.next_partition,
-            Selection::IncludeByIndex(include) => {
-                let slice = include.as_slice();
-                let pos = slice.partition_point(|&idx| idx < self.next_partition);
-                match slice.get(pos).copied() {
-                    Some(idx) if idx < self.end_partition => idx,
-                    _ => {
-                        self.next_partition = self.end_partition;
-                        return None;
-                    }
-                }
-            }
-            Selection::IncludeRoaring(roaring) => {
-                let next = if self.next_partition == 0 {
-                    roaring.min()
-                } else {
-                    let rank = roaring.rank(self.next_partition - 1);
-                    roaring.select(rank)
-                };
-                match next {
-                    Some(idx) if idx < self.end_partition => idx,
-                    _ => {
-                        self.next_partition = self.end_partition;
-                        return None;
-                    }
-                }
-            }
-            Selection::ExcludeByIndex(_) | Selection::ExcludeRoaring(_) => {
-                let mut candidate = self.next_partition;
-                while candidate < self.end_partition
-                    && !self.partition_selection.contains(candidate)
-                {
-                    candidate = candidate.saturating_add(1);
-                }
-                if candidate >= self.end_partition {
-                    self.next_partition = self.end_partition;
-                    return None;
-                }
-                candidate
-            }
-        };
 
         self.next_partition = partition.saturating_add(1);
         let split_start = partition

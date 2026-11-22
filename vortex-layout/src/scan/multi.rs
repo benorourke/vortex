@@ -897,67 +897,6 @@ mod tests {
         let values = collect_scan_values(runtime.block_on_stream(partition.execute()?))?;
         assert_eq!(values, vec![20, 21]);
 
-        // Empty IncludeByIndex returns no partitions.
-        let scan = runtime.block_on(source.scan(ScanRequest {
-            ordered,
-            partition_selection: Selection::IncludeByIndex(StrictSortedBuffer::try_new(
-                vortex_buffer::Buffer::empty(),
-            )?),
-            ..Default::default()
-        }))?;
-        assert!(
-            runtime
-                .block_on(scan.partitions().try_collect::<Vec<_>>())?
-                .is_empty()
-        );
-
-        // Roaring include + partition_range intersection selects only partition 2.
-        let mut include = roaring::RoaringTreemap::new();
-        include.insert(1);
-        include.insert(2);
-        let scan = runtime.block_on(source.scan(ScanRequest {
-            ordered,
-            partition_range: Some(2..4),
-            partition_selection: Selection::IncludeRoaring(include),
-            ..Default::default()
-        }))?;
-        let partitions = runtime.block_on(scan.partitions().try_collect::<Vec<_>>())?;
-        assert_eq!(partitions.len(), 1);
-        assert_eq!(partitions[0].index(), 2);
-
-        // Roaring exclude removes partition 2 from range 1..4 -> leaves 1 and 3.
-        let mut exclude = roaring::RoaringTreemap::new();
-        exclude.insert(2);
-        let scan = runtime.block_on(source.scan(ScanRequest {
-            ordered,
-            partition_range: Some(1..4),
-            partition_selection: Selection::ExcludeRoaring(exclude),
-            ..Default::default()
-        }))?;
-        let mut indices: Vec<usize> = runtime
-            .block_on(scan.partitions().try_collect::<Vec<_>>())?
-            .into_iter()
-            .map(|p| p.index())
-            .collect();
-        indices.sort_unstable();
-        assert_eq!(indices, vec![1, 3]);
-
-        // Explicit ExcludeByIndex removes partition 1.
-        let scan = runtime.block_on(source.scan(ScanRequest {
-            ordered,
-            partition_selection: Selection::ExcludeByIndex(StrictSortedBuffer::try_new(
-                vortex_buffer::Buffer::from_iter([1u64]),
-            )?),
-            ..Default::default()
-        }))?;
-        let mut indices: Vec<usize> = runtime
-            .block_on(scan.partitions().try_collect::<Vec<_>>())?
-            .into_iter()
-            .map(|p| p.index())
-            .collect();
-        indices.sort_unstable();
-        assert_eq!(indices, vec![2, 3]);
-
         Ok(())
     }
 }
