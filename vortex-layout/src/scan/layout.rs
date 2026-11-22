@@ -451,12 +451,6 @@ impl Partition for Empty {
     }
 
     fn execute(mut self: Box<Self>) -> VortexResult<SendableArrayStream> {
-        if self.row_count > 0
-            && let Some(recorder) = self.recorder.take()
-        {
-            recorder.attempt_file_scan();
-            recorder.attempt_split();
-        }
         let scalar = Scalar::default_value(&self.dtype);
         let dtype = self.dtype.clone();
 
@@ -464,6 +458,10 @@ impl Partition for Empty {
         let iter = std::iter::from_fn(move || {
             if self.row_count == 0 {
                 return None;
+            }
+            if let Some(recorder) = self.recorder.take() {
+                recorder.attempt_file_scan();
+                recorder.attempt_split();
             }
             let chunk_size = usize::try_from(self.row_count).unwrap_or(usize::MAX);
             self.row_count -= chunk_size as u64;

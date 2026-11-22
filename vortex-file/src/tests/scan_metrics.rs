@@ -672,3 +672,54 @@ async fn test_equivalent_scan_entry_points_record_usage() -> VortexResult<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn test_data_source_empty_projection_records_attempts_on_first_poll() -> VortexResult<()> {
+    let file = scan_file([[0, 1], [10, 11], [90, 91], [100, 101]]).await?;
+    let empty_proj = vortex_array::expr::pack(
+        std::iter::empty::<(&str, Expression)>(),
+        vortex_array::dtype::Nullability::NonNullable,
+    );
+
+    // Dropping the unpolled result stream leaves file and split attempt counts at zero.
+    let unpolled_usage = Arc::new(ScanUsage::default());
+    let unpolled_ds = file
+        .clone()
+        .with_usage(Arc::clone(&unpolled_usage))
+        .data_source()?;
+    let unpolled_scan = unpolled_ds
+        .scan(ScanRequest {
+            projection: empty_proj.clone(),
+            ..Default::default()
+        })
+        .await?;
+    let unpolled_parts = unpolled_scan.partitions().try_collect::<Vec<_>>().await?;
+    assert_eq!(unpolled_parts.len(), 1);
+    let stream = unpolled_parts.into_iter().next().unwrap().execute()?;
+    drop(stream);
+    assert_usage(&unpolled_usage, [0, 0, 0, 0, 0]);
+
+    // Consuming the stream once records one file attempt and one split attempt.
+    let polled_usage = Arc::new(ScanUsage::default());
+    let polled_ds = file.with_usage(Arc::clone(&polled_usage)).data_source()?;
+    let polled_scan = polled_ds
+        .scan(ScanRequest {
+            projection: empty_proj,
+            ..Default::default()
+        })
+        .await?;
+    let polled_parts = polled_scan.partitions().try_collect::<Vec<_>>().await?;
+    assert_eq!(polled_parts.len(), 1);
+    let arrays = polled_parts
+        .into_iter()
+        .next()
+        .unwrap()
+        .execute()?
+        .try_collect::<Vec<_>>()
+        .await?;
+    let rows: usize = arrays.iter().map(|a| a.len()).sum();
+    assert_eq!(rows, 8);
+    assert_usage(&polled_usage, [1, 0, 0, 0, 1]);
+
+    Ok(())
+}
