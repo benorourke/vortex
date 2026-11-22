@@ -165,7 +165,12 @@ impl Planner for PrunePlanner {
                 && let Some(recorder) = &self.scan.recorder
                 && self.scan.selection.row_count_in_range(&self.rows) != 0
             {
-                recorder.prune_file();
+                if self.rows == (0..self.scan.projection.row_count()) {
+                    recorder.prune_file();
+                } else {
+                    recorder.attempt_split();
+                    recorder.prune_split();
+                }
             }
             self.done = true;
             return Ok(PlannerOutput::Done);

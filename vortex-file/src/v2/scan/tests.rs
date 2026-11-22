@@ -167,6 +167,26 @@ async fn v2_scan_records_usage_and_metrics() -> VortexResult<()> {
         "expected either file pruning or predicate-empty split, got {after_pred:?}"
     );
 
+    // Statistics rejecting only a partial row range count as a pruned split, not whole-file pruning.
+    let before_partial = usage.snapshot();
+    let partial_empty: Vec<ArrayRef> = driver()
+        .run(
+            ScanBuilder::new(SESSION.clone(), tracked.scan_file())
+                .with_row_range(0..1)
+                .with_some_filter(Some(
+                    gt(col("numbers"), lit(1_000_000i32)).bind(file.dtype())?,
+                ))
+                .with_scan_metrics(metrics.clone()),
+        )
+        .try_collect()
+        .await?;
+    assert!(partial_empty.is_empty());
+    let after_partial = usage.snapshot().since(&before_partial);
+    assert_eq!(after_partial.file_scans_attempted, 1);
+    assert_eq!(after_partial.file_scans_pruned, 0);
+    assert_eq!(after_partial.splits_attempted, 1);
+    assert_eq!(after_partial.splits_pruned, 1);
+
     // Repeated execution increments file_scans_attempted again.
     let before_repeat = usage.snapshot();
     let _again: Vec<ArrayRef> = driver()
