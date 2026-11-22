@@ -28,6 +28,7 @@ use vortex_array::stream::ArrayStreamExt;
 use vortex_array::stream::SendableArrayStream;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
+use vortex_error::vortex_ensure;
 use vortex_mask::Mask;
 use vortex_metrics::MetricsRegistry;
 use vortex_scan::DataSource;
@@ -46,13 +47,133 @@ use crate::scan::metrics::ScanMetrics;
 use crate::scan::metrics::ScanRecorder;
 use crate::scan::scan_builder::ScanBuilder;
 
-fn partition_selected(
-    partition_idx: u64,
-    partition_range: Option<&Range<u64>>,
-    partition_selection: &Selection,
-) -> bool {
-    partition_range.is_none_or(|range| range.contains(&partition_idx))
-        && partition_selection.contains(partition_idx)
+/// Cursor over absolute split-grid partition indices for a [`LayoutReaderDataSource`].
+///
+/// Each split occupies a fixed `[p * split_size, (p + 1) * split_size)` slot on the source so
+/// `Partition::index()` remains stable across `row_range`, `partition_range`, and
+/// `partition_selection` requests.
+struct PartitionCursor {
+    row_range: Range<u64>,
+    split_size: u64,
+    next_partition: u64,
+    end_partition: u64,
+    partition_selection: Selection,
+}
+
+impl PartitionCursor {
+    fn new(
+        row_range: Range<u64>,
+        split_size: u64,
+        partition_range: Option<Range<u64>>,
+        partition_selection: Selection,
+    ) -> Self {
+        let min_part = row_range.start / split_size;
+        let max_part = if row_range.start >= row_range.end {
+            min_part
+        } else {
+            row_range.end.div_ceil(split_size)
+        };
+        let start = partition_range
+            .as_ref()
+            .map_or(min_part, |range| min_part.max(range.start));
+        let end = partition_range
+            .as_ref()
+            .map_or(max_part, |range| max_part.min(range.end));
+        Self {
+            row_range,
+            split_size,
+            next_partition: start.min(end),
+            end_partition: end,
+            partition_selection,
+        }
+    }
+
+    fn empty() -> Self {
+        Self {
+            row_range: 0..0,
+            split_size: 1,
+            next_partition: 0,
+            end_partition: 0,
+            partition_selection: Selection::All,
+        }
+    }
+
+    fn next_selected(&mut self) -> Option<(usize, Range<u64>)> {
+        if self.next_partition >= self.end_partition {
+            return None;
+        }
+
+        let partition = match &self.partition_selection {
+            Selection::All => self.next_partition,
+            Selection::IncludeByIndex(include) => {
+                let slice = include.as_slice();
+                let pos = slice.partition_point(|&idx| idx < self.next_partition);
+                match slice.get(pos).copied() {
+                    Some(idx) if idx < self.end_partition => idx,
+                    _ => {
+                        self.next_partition = self.end_partition;
+                        return None;
+                    }
+                }
+            }
+            Selection::IncludeRoaring(roaring) => {
+                let next = if self.next_partition == 0 {
+                    roaring.min()
+                } else {
+                    let rank = roaring.rank(self.next_partition - 1);
+                    roaring.select(rank)
+                };
+                match next {
+                    Some(idx) if idx < self.end_partition => idx,
+                    _ => {
+                        self.next_partition = self.end_partition;
+                        return None;
+                    }
+                }
+            }
+            Selection::ExcludeByIndex(_) | Selection::ExcludeRoaring(_) => {
+                let mut candidate = self.next_partition;
+                while candidate < self.end_partition
+                    && !self.partition_selection.contains(candidate)
+                {
+                    candidate = candidate.saturating_add(1);
+                }
+                if candidate >= self.end_partition {
+                    self.next_partition = self.end_partition;
+                    return None;
+                }
+                candidate
+            }
+        };
+
+        self.next_partition = partition.saturating_add(1);
+        let split_start = partition
+            .saturating_mul(self.split_size)
+            .max(self.row_range.start);
+        let split_end = partition
+            .saturating_add(1)
+            .saturating_mul(self.split_size)
+            .min(self.row_range.end);
+        let partition_idx = usize::try_from(partition).unwrap_or(usize::MAX);
+        Some((partition_idx, split_start..split_end))
+    }
+
+    fn remaining_upper_bound(&self) -> usize {
+        if self.next_partition >= self.end_partition {
+            return 0;
+        }
+        let max_remaining = self.end_partition - self.next_partition;
+        let bound = match &self.partition_selection {
+            Selection::IncludeByIndex(include) => {
+                let slice = include.as_slice();
+                let start = slice.partition_point(|&idx| idx < self.next_partition);
+                let end = slice.partition_point(|&idx| idx < self.end_partition);
+                (end - start) as u64
+            }
+            _ => max_remaining,
+        };
+        usize::try_from(bound).unwrap_or(usize::MAX)
+    }
 }
 
 /// An implementation of a [`DataSource`] that reads data from a [`LayoutReaderRef`].
@@ -125,6 +246,11 @@ impl DataSource for LayoutReaderDataSource {
     }
 
     async fn scan(&self, scan_request: ScanRequest) -> VortexResult<DataSourceScanRef> {
+        vortex_ensure!(
+            self.split_max_row_count > 0,
+            "split_max_row_count must be greater than 0"
+        );
+
         let total_rows = self.reader.row_count();
         let row_range = scan_request.row_range.unwrap_or(0..total_rows);
 
@@ -138,65 +264,25 @@ impl DataSource for LayoutReaderDataSource {
             .transpose()?;
         let dtype = projection.dtype().clone();
 
+        let cursor = PartitionCursor::new(
+            row_range.clone(),
+            self.split_max_row_count,
+            scan_request.partition_range,
+            scan_request.partition_selection,
+        );
+
         // If the dtype is an empty struct, and there is no filter, we can return a special
-        // length-only scan.
+        // length-only scan that preserves the same split-grid partition identities.
         if let DType::Struct(fields, Nullability::NonNullable) = &dtype
             && fields.nfields() == 0
             && filter.is_none()
         {
-            if scan_request.partition_range.is_none()
-                && matches!(scan_request.partition_selection, Selection::All)
-            {
-                // FIXME(ngates): extract out maybe?
-                let row_count = scan_request.selection.row_count_in_range(&row_range);
-
-                // Apply the limit.
-                let row_count = if let Some(limit) = scan_request.limit {
-                    row_count.min(limit)
-                } else {
-                    row_count
-                };
-
-                return Ok(Box::new(Empty {
-                    dtype,
-                    row_count,
-                    partition_idx: 0,
-                }));
-            }
-
-            let mut partitions = Vec::new();
-            let mut next_row = row_range.start;
-            let mut partition_idx = 0usize;
-            let mut remaining_limit = scan_request.limit;
-            while next_row < row_range.end {
-                if remaining_limit == Some(0) {
-                    break;
-                }
-                let split_end = next_row
-                    .saturating_add(self.split_max_row_count)
-                    .min(row_range.end);
-                if partition_selected(
-                    partition_idx as u64,
-                    scan_request.partition_range.as_ref(),
-                    &scan_request.partition_selection,
-                ) {
-                    let mut count = scan_request
-                        .selection
-                        .row_count_in_range(&(next_row..split_end));
-                    if let Some(ref mut remaining) = remaining_limit {
-                        count = count.min(*remaining);
-                        *remaining -= count;
-                    }
-                    partitions.push(Empty {
-                        dtype: dtype.clone(),
-                        row_count: count,
-                        partition_idx,
-                    });
-                }
-                next_row = split_end;
-                partition_idx += 1;
-            }
-            return Ok(Box::new(EmptyScan { dtype, partitions }));
+            return Ok(Box::new(EmptyScan {
+                dtype,
+                cursor,
+                selection: scan_request.selection,
+                remaining_limit: scan_request.limit,
+            }));
         }
 
         // If statistics reject the entire requested range, skip the scan before partition construction.
@@ -232,11 +318,7 @@ impl DataSource for LayoutReaderDataSource {
                     }
                 }
 
-                return Ok(Box::new(Empty {
-                    dtype,
-                    row_count: 0,
-                    partition_idx: 0,
-                }));
+                return Ok(Box::new(EmptyScan::empty(dtype)));
             }
         }
 
@@ -256,15 +338,10 @@ impl DataSource for LayoutReaderDataSource {
             remaining_limit: scan_request.limit,
             row_limit,
             selection: scan_request.selection,
-            partition_selection: scan_request.partition_selection,
-            partition_range: scan_request.partition_range,
             ordered: scan_request.ordered,
             split_concurrency: scan_request.split_concurrency,
             metrics: self.metrics.clone(),
-            next_row: row_range.start,
-            end_row: row_range.end,
-            split_size: self.split_max_row_count,
-            partition_idx: 0,
+            cursor,
         }))
     }
 
@@ -288,13 +365,8 @@ struct LayoutReaderScan {
     ordered: bool,
     split_concurrency: Option<NonZeroUsize>,
     selection: Selection,
-    partition_selection: Selection,
-    partition_range: Option<Range<u64>>,
     metrics: Option<ScanMetrics>,
-    next_row: u64,
-    end_row: u64,
-    split_size: u64,
-    partition_idx: usize,
+    cursor: PartitionCursor,
 }
 
 impl DataSourceScan for LayoutReaderScan {
@@ -322,76 +394,54 @@ impl Stream for LayoutReaderScan {
     fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
 
-        while this.next_row < this.end_row {
-            if this.remaining_limit.is_some_and(|limit| limit == 0) {
-                return Poll::Ready(None);
-            }
-            if this.row_limit.as_ref().is_some_and(RowLimit::is_exhausted) {
-                return Poll::Ready(None);
-            }
-
-            let split_end = this
-                .next_row
-                .saturating_add(this.split_size)
-                .min(this.end_row);
-            let row_range = this.next_row..split_end;
-            let partition_idx = this.partition_idx;
-
-            this.next_row = split_end;
-            this.partition_idx += 1;
-
-            if !partition_selected(
-                partition_idx as u64,
-                this.partition_range.as_ref(),
-                &this.partition_selection,
-            ) {
-                continue;
-            }
-
-            // Snapshot before decrementing: a split's cap must cover the rows it will itself return.
-            let split_limit = this.remaining_limit;
-            // Without a filter, a split returns exactly its selected rows, so the countdown stays
-            // exact. With a filter the split's contribution is unknowable up front, so every split
-            // receives the full remaining limit and the total is enforced by the shared `row_limit`
-            // (unordered scans) or by the engine trimming the concatenated result (ordered scans).
-            if this.filter.is_none()
-                && let Some(ref mut remaining) = this.remaining_limit
-            {
-                *remaining =
-                    remaining.saturating_sub(this.selection.row_count_in_range(&row_range));
-            }
-
-            let split = Box::new(LayoutReaderSplit {
-                reader: Arc::clone(&this.reader),
-                session: this.session.clone(),
-                projection: this.projection.clone(),
-                filter: this.filter.clone(),
-                limit: split_limit,
-                row_limit: this.row_limit.clone(),
-                ordered: this.ordered,
-                split_concurrency: this.split_concurrency,
-                row_range,
-                selection: this.selection.clone(),
-                metrics: this.metrics.clone(),
-                partition_idx,
-            }) as PartitionRef;
-
-            return Poll::Ready(Some(Ok(split)));
+        if this.remaining_limit.is_some_and(|limit| limit == 0) {
+            return Poll::Ready(None);
+        }
+        if this.row_limit.as_ref().is_some_and(RowLimit::is_exhausted) {
+            return Poll::Ready(None);
         }
 
-        Poll::Ready(None)
+        let Some((partition_idx, row_range)) = this.cursor.next_selected() else {
+            return Poll::Ready(None);
+        };
+
+        // Snapshot before decrementing: a split's cap must cover the rows it will itself return.
+        let split_limit = this.remaining_limit;
+        // Without a filter, a split returns exactly its selected rows, so the countdown stays
+        // exact. With a filter the split's contribution is unknowable up front, so every split
+        // receives the full remaining limit and the total is enforced by the shared `row_limit`
+        // (unordered scans) or by the engine trimming the concatenated result (ordered scans).
+        if this.filter.is_none()
+            && let Some(ref mut remaining) = this.remaining_limit
+        {
+            *remaining = remaining.saturating_sub(this.selection.row_count_in_range(&row_range));
+        }
+
+        let split = Box::new(LayoutReaderSplit {
+            reader: Arc::clone(&this.reader),
+            session: this.session.clone(),
+            projection: this.projection.clone(),
+            filter: this.filter.clone(),
+            limit: split_limit,
+            row_limit: this.row_limit.clone(),
+            ordered: this.ordered,
+            split_concurrency: this.split_concurrency,
+            row_range,
+            selection: this.selection.clone(),
+            metrics: this.metrics.clone(),
+            partition_idx,
+        }) as PartitionRef;
+
+        Poll::Ready(Some(Ok(split)))
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        if self.next_row >= self.end_row
-            || self.remaining_limit.is_some_and(|limit| limit == 0)
+        if self.remaining_limit.is_some_and(|limit| limit == 0)
             || self.row_limit.as_ref().is_some_and(RowLimit::is_exhausted)
         {
             return (0, Some(0));
         }
-        let remaining_rows = self.end_row - self.next_row;
-        let splits = remaining_rows.div_ceil(self.split_size);
-        (0, Some(usize::try_from(splits).unwrap_or(usize::MAX)))
+        (0, Some(self.cursor.remaining_upper_bound()))
     }
 }
 
@@ -470,7 +520,20 @@ struct Empty {
 
 struct EmptyScan {
     dtype: DType,
-    partitions: Vec<Empty>,
+    cursor: PartitionCursor,
+    selection: Selection,
+    remaining_limit: Option<u64>,
+}
+
+impl EmptyScan {
+    fn empty(dtype: DType) -> Self {
+        Self {
+            dtype,
+            cursor: PartitionCursor::empty(),
+            selection: Selection::All,
+            remaining_limit: Some(0),
+        }
+    }
 }
 
 impl DataSourceScan for EmptyScan {
@@ -479,30 +542,51 @@ impl DataSourceScan for EmptyScan {
     }
 
     fn partition_count(&self) -> Precision<usize> {
-        Precision::exact(self.partitions.len())
+        let (lower, upper) = self.size_hint();
+        match upper {
+            Some(u) if u == lower => Precision::exact(lower),
+            Some(u) => Precision::inexact(u),
+            None => Precision::inexact(lower),
+        }
     }
 
     fn partitions(self: Box<Self>) -> PartitionStream {
-        stream::iter(
-            self.partitions
-                .into_iter()
-                .map(|partition| Ok(Box::new(partition) as PartitionRef)),
-        )
-        .boxed()
+        (*self).boxed()
     }
 }
 
-impl DataSourceScan for Empty {
-    fn dtype(&self) -> &DType {
-        &self.dtype
+impl Stream for EmptyScan {
+    type Item = VortexResult<PartitionRef>;
+
+    fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+
+        if this.remaining_limit.is_some_and(|limit| limit == 0) {
+            return Poll::Ready(None);
+        }
+
+        let Some((partition_idx, row_range)) = this.cursor.next_selected() else {
+            return Poll::Ready(None);
+        };
+
+        let mut count = this.selection.row_count_in_range(&row_range);
+        if let Some(ref mut remaining) = this.remaining_limit {
+            count = count.min(*remaining);
+            *remaining -= count;
+        }
+
+        Poll::Ready(Some(Ok(Box::new(Empty {
+            dtype: this.dtype.clone(),
+            row_count: count,
+            partition_idx,
+        }) as PartitionRef)))
     }
 
-    fn partition_count(&self) -> Precision<usize> {
-        Precision::exact(1usize)
-    }
-
-    fn partitions(self: Box<Self>) -> PartitionStream {
-        stream::iter([Ok(self as _)]).boxed()
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        if self.remaining_limit.is_some_and(|limit| limit == 0) {
+            return (0, Some(0));
+        }
+        (0, Some(self.cursor.remaining_upper_bound()))
     }
 }
 
@@ -730,9 +814,8 @@ mod tests {
 
         // Exclude partition 0 with limit 2: only eligible partitions count toward limit,
         // so partition 1 ([2, 3]) is returned.
-        let exclude_zero = Selection::ExcludeByIndex(StrictSortedBuffer::try_new(
-            Buffer::from_iter([0u64]),
-        )?);
+        let exclude_zero =
+            Selection::ExcludeByIndex(StrictSortedBuffer::try_new(Buffer::from_iter([0u64]))?);
         let normal_scan = runtime.block_on(source.scan(ScanRequest {
             partition_selection: exclude_zero.clone(),
             limit: Some(2),
@@ -770,7 +853,8 @@ mod tests {
         assert_eq!(empty_rows, 2);
 
         // Empty include returns 0 partitions on both normal and empty-projection paths.
-        let empty_include = Selection::IncludeByIndex(StrictSortedBuffer::try_new(Buffer::empty())?);
+        let empty_include =
+            Selection::IncludeByIndex(StrictSortedBuffer::try_new(Buffer::empty())?);
         let normal_empty = runtime.block_on(source.scan(ScanRequest {
             partition_selection: empty_include.clone(),
             ..Default::default()
@@ -809,7 +893,7 @@ mod tests {
         assert_eq!(vals, vec![4, 5]);
 
         let empty_roaring = runtime.block_on(source.scan(ScanRequest {
-            projection: empty_proj,
+            projection: empty_proj.clone(),
             partition_range: Some(1..3),
             partition_selection: Selection::IncludeRoaring(roaring),
             ..Default::default()
@@ -817,6 +901,60 @@ mod tests {
         let parts = runtime.block_on(empty_roaring.partitions().try_collect::<Vec<_>>())?;
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0].index(), 2);
+
+        // Row-range scans preserve absolute split-grid partition indices.
+        let range_scan = runtime.block_on(source.scan(ScanRequest {
+            row_range: Some(2..6),
+            partition_selection: Selection::IncludeByIndex(StrictSortedBuffer::try_new(
+                Buffer::from_iter([1u64]),
+            )?),
+            ..Default::default()
+        }))?;
+        let parts = runtime.block_on(range_scan.partitions().try_collect::<Vec<_>>())?;
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].index(), 1);
+        let vals = collect_scan_values(
+            runtime.block_on_stream(parts.into_iter().next().unwrap().execute()?),
+        )?;
+        assert_eq!(vals, vec![2, 3]);
+
+        // Empty-projection discovery and partition replay emit identical split-grid partitions.
+        let discovered = runtime.block_on(source.scan(ScanRequest {
+            projection: empty_proj.clone(),
+            ..Default::default()
+        }))?;
+        let discovered_parts = runtime.block_on(discovered.partitions().try_collect::<Vec<_>>())?;
+        let discovered_ids: Vec<usize> = discovered_parts.iter().map(|p| p.index()).collect();
+        assert_eq!(discovered_ids, vec![0, 1, 2]);
+        let mut replayed_rows = 0usize;
+        for id in discovered_ids {
+            let replay = runtime.block_on(source.scan(ScanRequest {
+                projection: empty_proj.clone(),
+                partition_selection: Selection::IncludeByIndex(StrictSortedBuffer::try_new(
+                    Buffer::from_iter([id as u64]),
+                )?),
+                ..Default::default()
+            }))?;
+            for part in runtime.block_on(replay.partitions().try_collect::<Vec<_>>())? {
+                for array in runtime.block_on(part.execute()?.try_collect::<Vec<_>>())? {
+                    replayed_rows += array.len();
+                }
+            }
+        }
+        assert_eq!(replayed_rows, 6);
+
+        // Zero split_max_row_count is rejected instead of looping.
+        let zero_split = LayoutReaderDataSource::new(
+            Arc::new(TestLayoutReader::new(6)),
+            session_with_handle(runtime.handle()),
+        )
+        .with_split_max_row_count(0);
+        assert!(
+            runtime
+                .block_on(zero_split.scan(ScanRequest::default()))
+                .is_err()
+        );
+
         Ok(())
     }
 }

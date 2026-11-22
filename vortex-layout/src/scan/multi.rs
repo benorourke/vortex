@@ -429,7 +429,8 @@ impl DataSourceScan for MultiLayoutScan {
         let ordered = request.ordered;
 
         // Pre-opened readers are immediately available with their discovery partition IDs.
-        let ready_stream = stream::iter(ready).map(|(partition_idx, reader)| (partition_idx, Ok(reader)));
+        let ready_stream =
+            stream::iter(ready).map(|(partition_idx, reader)| (partition_idx, Ok(reader)));
 
         // Deferred readers are opened concurrently via spawned tasks while preserving their
         // discovery partition IDs across asynchronous completions and `Ok(None)` pruning.
