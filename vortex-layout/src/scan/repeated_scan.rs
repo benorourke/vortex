@@ -178,7 +178,8 @@ impl<A: 'static + Send> RepeatedScan<A> {
         }
     }
 
-    /// Each execution gets its own recorder, so file events count once for each execution.
+    /// Uses the shared recorder of a data-source scan when one is set; otherwise each execution
+    /// gets its own recorder, so file events count once for each execution.
     fn task_context(&self) -> Arc<TaskContext> {
         let recorder = self
             .recorder

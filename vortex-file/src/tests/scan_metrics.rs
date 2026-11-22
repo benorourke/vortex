@@ -27,6 +27,7 @@ use vortex_array::stream::ArrayStreamExt;
 use vortex_buffer::ByteBufferMut;
 use vortex_buffer::buffer;
 use vortex_error::VortexResult;
+use vortex_error::vortex_err;
 use vortex_io::runtime::tokio::TokioRuntime;
 use vortex_layout::layouts::chunked::writer::ChunkedLayoutStrategy;
 use vortex_layout::layouts::flat::writer::FlatLayoutStrategy;
@@ -53,6 +54,7 @@ use super::pruning_aggregate_fns;
 use crate::OpenOptionsSessionExt;
 use crate::VortexFile;
 use crate::WriteOptionsSessionExt;
+use crate::v2::ScanDriver;
 
 async fn scan_file(values: [[i32; 2]; 4]) -> VortexResult<VortexFile> {
     let chunks = values
@@ -573,8 +575,6 @@ async fn test_data_source_multi_partition_shares_file_attempt_guard() -> VortexR
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_equivalent_scan_entry_points_record_usage() -> VortexResult<()> {
-    use crate::v2::ScanDriver;
-
     let file = scan_file([[0, 1], [10, 11], [90, 91], [100, 101]]).await?;
 
     // Normal full scan across V1, DataSource, and V2.
@@ -694,8 +694,10 @@ async fn test_data_source_empty_projection_records_attempts_on_first_poll() -> V
         })
         .await?;
     let unpolled_parts = unpolled_scan.partitions().try_collect::<Vec<_>>().await?;
-    assert_eq!(unpolled_parts.len(), 1);
-    let stream = unpolled_parts.into_iter().next().unwrap().execute()?;
+    let [unpolled_part]: [_; 1] = unpolled_parts
+        .try_into()
+        .map_err(|parts: Vec<_>| vortex_err!("expected 1 partition, got {}", parts.len()))?;
+    let stream = unpolled_part.execute()?;
     drop(stream);
     assert_usage(&unpolled_usage, [0, 0, 0, 0, 0]);
 
@@ -709,14 +711,10 @@ async fn test_data_source_empty_projection_records_attempts_on_first_poll() -> V
         })
         .await?;
     let polled_parts = polled_scan.partitions().try_collect::<Vec<_>>().await?;
-    assert_eq!(polled_parts.len(), 1);
-    let arrays = polled_parts
-        .into_iter()
-        .next()
-        .unwrap()
-        .execute()?
-        .try_collect::<Vec<_>>()
-        .await?;
+    let [polled_part]: [_; 1] = polled_parts
+        .try_into()
+        .map_err(|parts: Vec<_>| vortex_err!("expected 1 partition, got {}", parts.len()))?;
+    let arrays = polled_part.execute()?.try_collect::<Vec<_>>().await?;
     let rows: usize = arrays.iter().map(|a| a.len()).sum();
     assert_eq!(rows, 8);
     assert_usage(&polled_usage, [1, 0, 0, 0, 1]);

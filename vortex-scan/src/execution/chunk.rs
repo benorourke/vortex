@@ -148,3 +148,76 @@ impl Planner for ChunkPlanner {
         Ok(PlannerOutput::Done)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use vortex_error::VortexResult;
+    use vortex_error::vortex_bail;
+    use vortex_mask::Mask;
+    use vortex_session::VortexSession;
+
+    use super::ChunkPlanner;
+    use crate::execution::pipeline::synthetic::RowSource;
+    use crate::metrics::ScanUsage;
+    use crate::plan::LazyPlanRef;
+    use crate::planning::planner::Planner;
+    use crate::planning::planner::PlannerOutput;
+    use crate::prepare::ScanBuilder;
+    use crate::selection::Selection;
+    use crate::source::ScanInput;
+    use crate::source::SegmentFuture;
+    use crate::source::SegmentId;
+    use crate::source::SegmentSource;
+
+    struct NoSegments;
+
+    impl SegmentSource for NoSegments {
+        fn request(&self, _id: SegmentId) -> SegmentFuture {
+            Box::pin(async { vortex_bail!("in-memory test source must not request segments") })
+        }
+    }
+
+    #[test]
+    fn pruned_chunks_record_split_pruning_without_file_pruning() -> VortexResult<()> {
+        let usage = Arc::new(ScanUsage::default());
+        let plan = RowSource::plan(12, vec![4, 4, 4], None, false);
+        let mut prepared = ScanBuilder::new(
+            VortexSession::empty(),
+            ScanInput {
+                dtype: plan.dtype().clone(),
+                root: LazyPlanRef::ready(plan),
+                locations: Arc::new([]),
+                segments: Arc::new(NoSegments),
+                cache: None,
+                usage: Some(Arc::clone(&usage)),
+            },
+        )
+        .prepare()?;
+        prepared.chunk_rows = 4;
+
+        // Three 4-row chunks: chunks 0 (0..4) and 2 (8..12) are fully pruned, chunk 1 (4..8) is kept.
+        let kept = Mask::from_iter([
+            false, false, false, false, true, true, true, true, false, false, false, false,
+        ]);
+        let mut planner = ChunkPlanner::new(Arc::new(prepared), 0..12, Selection::All, Some(kept));
+
+        let mut spawned_ranges = Vec::new();
+        loop {
+            match planner.compute()? {
+                PlannerOutput::Spawn(scope, _) => spawned_ranges.push(scope.rows),
+                PlannerOutput::Done => break,
+                other => vortex_bail!("unexpected planner output: {other:?}"),
+            }
+        }
+
+        assert_eq!(spawned_ranges, vec![4..8]);
+        let snap = usage.snapshot();
+        assert_eq!(snap.file_scans_attempted, 1);
+        assert_eq!(snap.file_scans_pruned, 0);
+        assert_eq!(snap.splits_attempted, 2);
+        assert_eq!(snap.splits_pruned, 2);
+        Ok(())
+    }
+}

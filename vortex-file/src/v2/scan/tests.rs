@@ -149,12 +149,13 @@ async fn v2_scan_records_usage_and_metrics() -> VortexResult<()> {
     assert_eq!(after_prune.file_scans_attempted, 1);
     assert_eq!(after_prune.file_scans_pruned, 1);
 
-    // Predicate that survives zone maps but matches no rows records empty_after_predicate.
+    // Predicate that survives zone maps ("b" is within ["a", "dddd"]) but matches no rows
+    // records empty_after_predicate without file-level pruning.
     let before_pred = usage.snapshot();
     let empty: Vec<ArrayRef> = driver()
         .run(
             ScanBuilder::new(SESSION.clone(), tracked.scan_file())
-                .with_some_filter(Some(eq(col("strings"), lit("missing")).bind(file.dtype())?))
+                .with_some_filter(Some(eq(col("strings"), lit("b")).bind(file.dtype())?))
                 .with_scan_metrics(metrics.clone()),
         )
         .try_collect()
@@ -162,10 +163,9 @@ async fn v2_scan_records_usage_and_metrics() -> VortexResult<()> {
     assert!(empty.is_empty());
     let after_pred = usage.snapshot().since(&before_pred);
     assert_eq!(after_pred.file_scans_attempted, 1);
-    assert!(
-        after_pred.file_scans_pruned == 1 || after_pred.splits_empty_after_predicate >= 1,
-        "expected either file pruning or predicate-empty split, got {after_pred:?}"
-    );
+    assert_eq!(after_pred.file_scans_pruned, 0);
+    assert_eq!(after_pred.splits_attempted, 1);
+    assert_eq!(after_pred.splits_empty_after_predicate, 1);
 
     // Statistics rejecting only a partial row range count as a pruned split, not whole-file pruning.
     let before_partial = usage.snapshot();
