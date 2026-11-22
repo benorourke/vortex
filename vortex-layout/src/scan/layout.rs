@@ -252,7 +252,10 @@ impl DataSource for LayoutReaderDataSource {
         );
 
         let total_rows = self.reader.row_count();
-        let row_range = scan_request.row_range.unwrap_or(0..total_rows);
+        let row_range = match scan_request.row_range {
+            Some(range) => range.start.min(total_rows)..range.end.min(total_rows),
+            None => 0..total_rows,
+        };
 
         let projection = scan_request
             .projection
@@ -942,6 +945,45 @@ mod tests {
             }
         }
         assert_eq!(replayed_rows, 6);
+
+        // Requesting a row_range beyond the file extent clamps to 0..total_rows so nonexistent
+        // partitions are never emitted and the last partition only covers real file rows.
+        for proj in [empty_proj.clone(), root()] {
+            let nonexistent = runtime.block_on(source.scan(ScanRequest {
+                projection: proj.clone(),
+                row_range: Some(0..8),
+                partition_range: Some(3..4),
+                ..Default::default()
+            }))?;
+            assert!(
+                runtime
+                    .block_on(nonexistent.partitions().try_collect::<Vec<_>>())?
+                    .is_empty()
+            );
+
+            let overlapping_end = runtime.block_on(source.scan(ScanRequest {
+                projection: proj,
+                row_range: Some(3..8),
+                partition_range: Some(2..4),
+                ..Default::default()
+            }))?;
+            let parts = runtime.block_on(overlapping_end.partitions().try_collect::<Vec<_>>())?;
+            assert_eq!(parts.len(), 1);
+            assert_eq!(parts[0].index(), 2);
+            let rows: usize = runtime
+                .block_on(
+                    parts
+                        .into_iter()
+                        .next()
+                        .unwrap()
+                        .execute()?
+                        .try_collect::<Vec<_>>(),
+                )?
+                .iter()
+                .map(|a| a.len())
+                .sum();
+            assert_eq!(rows, 2);
+        }
 
         // Zero split_max_row_count is rejected instead of looping.
         let zero_split = LayoutReaderDataSource::new(
