@@ -4,6 +4,7 @@
 //! CUDA executor for ZSTD decompression using nvcomp.
 
 use std::fmt::Debug;
+use std::future::Future;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -12,11 +13,13 @@ use tracing::debug;
 use tracing::instrument;
 use vortex::array::ArrayRef;
 use vortex::array::Canonical;
+use vortex::array::ExecutionCtx;
 use vortex::array::arrays::VarBinViewArray;
 use vortex::array::arrays::varbinview::BinaryView;
 use vortex::array::arrays::varbinview::build_views::MAX_BUFFER_LEN;
 use vortex::array::buffer::BufferHandle;
 use vortex::array::buffer::DeviceBuffer;
+use vortex::array::validity::Validity;
 use vortex::array::vtable::child_to_validity;
 use vortex::buffer::Alignment;
 use vortex::buffer::Buffer;
@@ -39,7 +42,8 @@ use vortex_cuda_driver::SyncOnDrop;
 use vortex_nvcomp::sys::nvcompStatus_t;
 use vortex_nvcomp::zstd as nvcomp_zstd;
 
-use super::zstd_buffers::validate_decompress_results;
+use super::zstd_buffers::copy_decompress_results_to_host;
+use super::zstd_buffers::validate_nvcomp_decompress_results;
 use crate::CudaBufferExt;
 use crate::CudaDeviceBuffer;
 use crate::executor::CudaExecute;
@@ -341,23 +345,59 @@ async fn decode_zstd(array: ZstdArray, ctx: &mut CudaExecutionCtx) -> VortexResu
     })?;
     finish_result?;
 
-    validate_decompress_results(
-        &expected_output_sizes,
-        exec.device_actual_sizes,
-        exec.device_statuses,
-    )
-    .await?;
+    let (actual_sizes, statuses) =
+        copy_decompress_results_to_host(exec.device_actual_sizes, exec.device_statuses).await?;
 
-    // Unconditionally copy back to the host as Zstd arrays are fully
-    // self-contained. They neither have any parent or child encodings.
-    //
-    // TODO(0ax1): Don't copy back to host once VarBinView supports buffer handles.
-    let host_buffer = CudaDeviceBuffer::new(exec.device_output)?
-        .copy_to_host(Alignment::new(1))?
-        .await?;
+    let device_output = exec.device_output;
+    finish_zstd_decompression(
+        &expected_output_sizes,
+        actual_sizes.as_slice(),
+        statuses.as_slice(),
+        || async move {
+            // Unconditionally copy back to the host as Zstd arrays are fully
+            // self-contained. They neither have any parent or child encodings.
+            //
+            // TODO(0ax1): Don't copy back to host once VarBinView supports buffer handles.
+            CudaDeviceBuffer::new(device_output)?
+                .copy_to_host(Alignment::new(1))?
+                .await
+        },
+        dtype,
+        validity,
+        n_rows,
+        slice_start,
+        slice_stop,
+        ctx.execution_ctx(),
+    )
+    .await
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "completion step takes the validated frame results, output loader, and slice metadata"
+)]
+async fn finish_zstd_decompression<F, Fut>(
+    expected_output_sizes: &[usize],
+    actual_sizes: &[usize],
+    statuses: &[nvcompStatus_t],
+    fetch_host_output: F,
+    dtype: DType,
+    validity: Validity,
+    n_rows: usize,
+    slice_start: usize,
+    slice_stop: usize,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<Canonical>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = VortexResult<ByteBuffer>>,
+{
+    validate_nvcomp_decompress_results(expected_output_sizes, actual_sizes, statuses)?;
+
+    let host_buffer = fetch_host_output().await?;
 
     let slice_value_indices = validity
-        .execute_mask(n_rows, ctx.execution_ctx())?
+        .execute_mask(n_rows, ctx)?
         .valid_counts_for_indices(&[slice_start, slice_stop]);
     let slice_value_idx_start = slice_value_indices[0];
     let slice_value_idx_stop = slice_value_indices[1];
@@ -365,7 +405,7 @@ async fn decode_zstd(array: ZstdArray, ctx: &mut CudaExecutionCtx) -> VortexResu
     let sliced_validity = validity.slice(slice_start..slice_stop)?;
 
     match sliced_validity
-        .execute_mask(slice_stop - slice_start, ctx.execution_ctx())?
+        .execute_mask(slice_stop - slice_start, ctx)?
         .indices()
     {
         AllOr::All => {
@@ -390,11 +430,14 @@ async fn decode_zstd(array: ZstdArray, ctx: &mut CudaExecutionCtx) -> VortexResu
 #[cfg(test)]
 mod tests {
     use std::sync::LazyLock;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
 
     use vortex::array::IntoArray;
     use vortex::array::arrays::VarBinViewArray;
     use vortex::array::assert_arrays_eq;
     use vortex::array::optimizer::ArrayOptimizer;
+    use vortex::dtype::Nullability;
     use vortex::encodings::zstd::Zstd;
     use vortex::error::VortexExpect;
     use vortex::error::VortexResult;
@@ -404,7 +447,6 @@ mod tests {
     use super::*;
     use crate::CanonicalCudaExt;
     use crate::executor::CudaArrayExt;
-    use crate::kernel::encodings::zstd_buffers::validate_nvcomp_decompress_results;
     use crate::session::CudaSession;
 
     static SESSION: LazyLock<VortexSession> = LazyLock::new(VortexSession::empty);
@@ -613,28 +655,98 @@ mod tests {
     }
 
     #[test]
-    fn test_cuda_zstd_rejected_frame_never_reaches_reconstruction() {
-        // Truncated/corrupt buffer whose 4-byte length prefix exceeds the buffer length,
-        // so reaching `reconstruct_views` would panic.
+    fn test_cuda_zstd_rejected_frame_never_reaches_reconstruction() -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
+        let expected_strings = VarBinViewArray::from_iter_str(["hello", "world", "zstd"]);
+
+        // Build length-prefixed payload matching `reconstruct_views`:
+        // frame 0: "hello" (4 + 5 = 9 bytes),
+        // frame 1: "world" (4 + 5 = 9 bytes),
+        // frame 2: "zstd"  (4 + 4 = 8 bytes).
+        let mut valid_bytes = Vec::new();
+        for s in ["hello", "world", "zstd"] {
+            valid_bytes.extend_from_slice(&u32::try_from(s.len())?.to_le_bytes());
+            valid_bytes.extend_from_slice(s.as_bytes());
+        }
+        let valid_output = ByteBuffer::copy_from(&valid_bytes);
         let corrupt_output = ByteBuffer::copy_from([0xffu8, 0xff, 0xff, 0x7f]);
-        let expected = [16usize, 64, 24];
+        let expected_sizes = [9usize, 9, 8];
 
-        let run_validated = |actual: &[usize],
-                             statuses: &[nvcompStatus_t]|
-         -> VortexResult<(Vec<ByteBuffer>, Buffer<BinaryView>)> {
-            validate_nvcomp_decompress_results(&expected, actual, statuses)?;
-            Ok(reconstruct_views(&corrupt_output, 0, MAX_BUFFER_LEN))
-        };
-
+        // 1. Middle-frame status failure must reject before fetching/reconstructing output.
+        let fetch_calls = AtomicUsize::new(0);
         let failed_statuses = [
             vortex_nvcomp::sys::nvcompStatus_t_nvcompSuccess,
             vortex_nvcomp::sys::nvcompStatus_t_nvcompErrorCannotDecompress,
             vortex_nvcomp::sys::nvcompStatus_t_nvcompSuccess,
         ];
-        assert!(run_validated(&[16, 64, 24], &failed_statuses).is_err());
+        let err = futures::executor::block_on(finish_zstd_decompression(
+            &expected_sizes,
+            &expected_sizes,
+            &failed_statuses,
+            || {
+                fetch_calls.fetch_add(1, Ordering::SeqCst);
+                let buf = corrupt_output.clone();
+                async move { Ok(buf) }
+            },
+            DType::Utf8(Nullability::NonNullable),
+            Validity::NonNullable,
+            3,
+            0,
+            3,
+            &mut ctx,
+        ))
+        .expect_err("failed status must error before reconstruction");
+        assert!(
+            err.to_string().contains("chunk 1"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(fetch_calls.load(Ordering::SeqCst), 0);
 
+        // 2. Output-length mismatch must reject before fetching/reconstructing output.
         let ok_statuses = [vortex_nvcomp::sys::nvcompStatus_t_nvcompSuccess; 3];
-        assert!(run_validated(&[16, 32, 24], &ok_statuses).is_err());
+        let err = futures::executor::block_on(finish_zstd_decompression(
+            &expected_sizes,
+            &[9, 4, 8],
+            &ok_statuses,
+            || {
+                fetch_calls.fetch_add(1, Ordering::SeqCst);
+                let buf = corrupt_output.clone();
+                async move { Ok(buf) }
+            },
+            DType::Utf8(Nullability::NonNullable),
+            Validity::NonNullable,
+            3,
+            0,
+            3,
+            &mut ctx,
+        ))
+        .expect_err("size mismatch must error before reconstruction");
+        assert!(
+            err.to_string().contains("expected 9, got 4"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(fetch_calls.load(Ordering::SeqCst), 0);
+
+        // 3. Successful control reaches output fetch once and reconstructs the expected array.
+        let result = futures::executor::block_on(finish_zstd_decompression(
+            &expected_sizes,
+            &expected_sizes,
+            &ok_statuses,
+            || {
+                fetch_calls.fetch_add(1, Ordering::SeqCst);
+                let buf = valid_output.clone();
+                async move { Ok(buf) }
+            },
+            DType::Utf8(Nullability::NonNullable),
+            Validity::NonNullable,
+            3,
+            0,
+            3,
+            &mut ctx,
+        ))?;
+        assert_eq!(fetch_calls.load(Ordering::SeqCst), 1);
+        assert_arrays_eq!(result.into_array(), expected_strings, &mut ctx);
+        Ok(())
     }
 
     #[crate::test]
