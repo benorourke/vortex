@@ -59,6 +59,8 @@ pub struct ZstdKernelPrep {
     pub output_sizes_ptr: u64,
     /// Device pointer to array of pointers to output buffers.
     pub output_ptrs_ptr: u64,
+    /// Expected uncompressed size per frame on host.
+    pub output_sizes: Vec<usize>,
     /// Number of frames to decompress.
     pub num_frames: usize,
     /// Size of temporary buffer for nvcomp.
@@ -150,7 +152,7 @@ pub async fn zstd_kernel_prepare(
     let (frame_ptrs_handle, frame_sizes_handle, output_sizes_handle, output_ptrs_handle) = futures::try_join!(
         ctx.copy_to_device(frame_ptrs)?,
         ctx.copy_to_device(frame_sizes)?,
-        ctx.copy_to_device(output_sizes)?,
+        ctx.copy_to_device(output_sizes.clone())?,
         ctx.copy_to_device(output_ptrs)?
     )?;
 
@@ -170,6 +172,7 @@ pub async fn zstd_kernel_prepare(
         frame_sizes_ptr,
         output_sizes_ptr,
         output_ptrs_ptr,
+        output_sizes,
         num_frames,
         nvcomp_temp_buffer_size,
         device_actual_sizes,
@@ -248,12 +251,6 @@ async fn decode_zstd(array: ZstdArray, ctx: &mut CudaExecutionCtx) -> VortexResu
 
         return Ok(Canonical::VarBinView(result));
     }
-
-    let expected_output_sizes = metadata
-        .frames()
-        .iter()
-        .map(|frame| frame.get_uncompressed_size())
-        .collect::<VortexResult<Vec<_>>>()?;
 
     let mut exec = zstd_kernel_prepare(frames, &metadata, ctx).await?;
 
@@ -350,7 +347,7 @@ async fn decode_zstd(array: ZstdArray, ctx: &mut CudaExecutionCtx) -> VortexResu
 
     let device_output = exec.device_output;
     finish_zstd_decompression(
-        &expected_output_sizes,
+        &exec.output_sizes,
         actual_sizes.as_slice(),
         statuses.as_slice(),
         || async move {
