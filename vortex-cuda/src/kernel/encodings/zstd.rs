@@ -39,6 +39,7 @@ use vortex_cuda_driver::SyncOnDrop;
 use vortex_nvcomp::sys::nvcompStatus_t;
 use vortex_nvcomp::zstd as nvcomp_zstd;
 
+use super::zstd_buffers::validate_decompress_results;
 use crate::CudaBufferExt;
 use crate::CudaDeviceBuffer;
 use crate::executor::CudaExecute;
@@ -244,6 +245,12 @@ async fn decode_zstd(array: ZstdArray, ctx: &mut CudaExecutionCtx) -> VortexResu
         return Ok(Canonical::VarBinView(result));
     }
 
+    let expected_output_sizes = metadata
+        .frames()
+        .iter()
+        .map(|frame| frame.get_uncompressed_size())
+        .collect::<VortexResult<Vec<_>>>()?;
+
     let mut exec = zstd_kernel_prepare(frames, &metadata, ctx).await?;
 
     let stream = ctx.stream();
@@ -334,6 +341,13 @@ async fn decode_zstd(array: ZstdArray, ctx: &mut CudaExecutionCtx) -> VortexResu
     })?;
     finish_result?;
 
+    validate_decompress_results(
+        &expected_output_sizes,
+        exec.device_actual_sizes,
+        exec.device_statuses,
+    )
+    .await?;
+
     // Unconditionally copy back to the host as Zstd arrays are fully
     // self-contained. They neither have any parent or child encodings.
     //
@@ -390,6 +404,7 @@ mod tests {
     use super::*;
     use crate::CanonicalCudaExt;
     use crate::executor::CudaArrayExt;
+    use crate::kernel::encodings::zstd_buffers::validate_nvcomp_decompress_results;
     use crate::session::CudaSession;
 
     static SESSION: LazyLock<VortexSession> = LazyLock::new(VortexSession::empty);
@@ -523,6 +538,128 @@ mod tests {
             .into_array();
 
         assert_arrays_eq!(gpu_result, strings, &mut ctx);
+        Ok(())
+    }
+
+    #[test]
+    fn test_cuda_zstd_validate_nvcomp_results_success() -> VortexResult<()> {
+        let expected = [16usize, 64, 24];
+        let actual = [16usize, 64, 24];
+        let statuses = [vortex_nvcomp::sys::nvcompStatus_t_nvcompSuccess; 3];
+
+        validate_nvcomp_decompress_results(&expected, &actual, &statuses)
+    }
+
+    #[test]
+    fn test_cuda_zstd_validate_nvcomp_results_middle_frame_failure() {
+        let expected = [16usize, 64, 24];
+        let actual = [16usize, 64, 24];
+        let statuses = [
+            vortex_nvcomp::sys::nvcompStatus_t_nvcompSuccess,
+            vortex_nvcomp::sys::nvcompStatus_t_nvcompErrorCannotDecompress,
+            vortex_nvcomp::sys::nvcompStatus_t_nvcompSuccess,
+        ];
+
+        let err = validate_nvcomp_decompress_results(&expected, &actual, &statuses)
+            .expect_err("middle frame failure must return an error");
+        let msg = err.to_string();
+        assert!(msg.contains("chunk 1"), "unexpected error: {msg}");
+        assert!(
+            msg.contains(
+                &vortex_nvcomp::sys::nvcompStatus_t_nvcompErrorCannotDecompress.to_string()
+            ),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_cuda_zstd_validate_nvcomp_results_size_mismatch() {
+        let expected = [16usize, 64, 24];
+        let actual = [16usize, 32, 24];
+        let statuses = [vortex_nvcomp::sys::nvcompStatus_t_nvcompSuccess; 3];
+
+        let err = validate_nvcomp_decompress_results(&expected, &actual, &statuses)
+            .expect_err("size mismatch must return an error");
+        let msg = err.to_string();
+        assert!(msg.contains("chunk 1"), "unexpected error: {msg}");
+        assert!(
+            msg.contains("expected 64, got 32"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_cuda_zstd_validate_nvcomp_results_count_mismatch() {
+        let expected = [16usize, 64];
+        let actual = [16usize, 64];
+        let short_statuses = [vortex_nvcomp::sys::nvcompStatus_t_nvcompSuccess; 1];
+
+        let err = validate_nvcomp_decompress_results(&expected, &actual, &short_statuses)
+            .expect_err("status count mismatch must return an error");
+        assert!(
+            err.to_string().contains("nvcomp status count mismatch"),
+            "unexpected error: {err}"
+        );
+
+        let statuses = [vortex_nvcomp::sys::nvcompStatus_t_nvcompSuccess; 2];
+        let short_actual = [16usize; 1];
+        let err = validate_nvcomp_decompress_results(&expected, &short_actual, &statuses)
+            .expect_err("actual size count mismatch must return an error");
+        assert!(
+            err.to_string()
+                .contains("nvcomp actual output size count mismatch"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_cuda_zstd_rejected_frame_never_reaches_reconstruction() {
+        // Truncated/corrupt buffer whose 4-byte length prefix exceeds the buffer length,
+        // so reaching `reconstruct_views` would panic.
+        let corrupt_output = ByteBuffer::copy_from([0xffu8, 0xff, 0xff, 0x7f]);
+        let expected = [16usize, 64, 24];
+
+        let run_validated = |actual: &[usize],
+                             statuses: &[nvcompStatus_t]|
+         -> VortexResult<(Vec<ByteBuffer>, Buffer<BinaryView>)> {
+            validate_nvcomp_decompress_results(&expected, actual, statuses)?;
+            Ok(reconstruct_views(&corrupt_output, 0, MAX_BUFFER_LEN))
+        };
+
+        let failed_statuses = [
+            vortex_nvcomp::sys::nvcompStatus_t_nvcompSuccess,
+            vortex_nvcomp::sys::nvcompStatus_t_nvcompErrorCannotDecompress,
+            vortex_nvcomp::sys::nvcompStatus_t_nvcompSuccess,
+        ];
+        assert!(run_validated(&[16, 64, 24], &failed_statuses).is_err());
+
+        let ok_statuses = [vortex_nvcomp::sys::nvcompStatus_t_nvcompSuccess; 3];
+        assert!(run_validated(&[16, 32, 24], &ok_statuses).is_err());
+    }
+
+    #[crate::test]
+    async fn test_cuda_zstd_decompression_multiple_frames_binary() -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
+        let mut cuda_ctx = CudaSession::create_execution_ctx(&crate::cuda_session())
+            .vortex_expect("failed to create execution context");
+
+        let binary = VarBinViewArray::from_iter_bin([
+            b"the quick brown fox jumps over the lazy dog".as_slice(),
+            b"\x00\x01\x02\x03binary payload".as_slice(),
+            b"lorem ipsum dolor sit amet".as_slice(),
+            b"foo bar baz".as_slice(),
+            b"testing multiple binary frames".as_slice(),
+            b"short".as_slice(),
+            b"final binary payload value".as_slice(),
+        ]);
+
+        let zstd_array = Zstd::from_var_bin_view(&binary, 3, 3, cuda_ctx.execution_ctx())?;
+
+        let gpu_result = ZstdExecutor
+            .execute(zstd_array.into_array(), &mut cuda_ctx)
+            .await?;
+
+        assert_arrays_eq!(gpu_result.into_array(), binary, &mut ctx);
         Ok(())
     }
 }
