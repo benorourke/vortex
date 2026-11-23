@@ -23,7 +23,6 @@ use vortex_layout::scan::metrics::ScanUsage;
 use vortex_layout::scan::scan_builder::ScanBuilder;
 use vortex_layout::scan::split_by::SplitBy;
 use vortex_layout::scan::v2::ScanFile;
-use vortex_layout::segments::SegmentId;
 use vortex_layout::segments::SegmentSource;
 use vortex_layout::segments::UsageSegmentSource;
 use vortex_scan::DataSourceRef;
@@ -181,8 +180,6 @@ impl VortexFile {
         if let Some(loaded) = self.metadata.get(key) {
             return Ok(Some(loaded.clone()));
         }
-        // Metadata segments are numbered after the file's data segments, in footer order.
-        let first_metadata_id = self.footer.segment_map().len();
         let Some((index, (_, locator))) = self
             .footer
             .metadata_segments()
@@ -191,7 +188,7 @@ impl VortexFile {
         else {
             return Ok(None);
         };
-        let id = SegmentId::from(u32::try_from(first_metadata_id + index)?);
+        let id = self.footer.metadata_segment_id(index)?;
         let buffer = self
             .segment_source
             .request(id)

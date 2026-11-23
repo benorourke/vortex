@@ -689,3 +689,32 @@ def test_to_polars_unchanged_without_stored_schema(tmp_path) -> None:
     path = str(tmp_path / "plain.vortex")
     vx.io.VortexWriteOptions.default().write(vx.array(["a", "b"]), path)
     assert vx.open(path).arrow_schema() is None
+
+
+@pytest.fixture
+def nested_enum_file(tmp_path) -> tuple[vx.VortexFile, pl.DataFrame]:
+    df = pl.DataFrame(
+        {
+            "i": list(range(4)),
+            "st": pl.Series([{"e": "a"}, {"e": "z"}, {"e": "m"}, {"e": None}], dtype=pl.Struct({"e": ENUM})),
+            "ls": pl.Series([["a"], ["z", "m"], [], None], dtype=pl.List(ENUM)),
+        }
+    )
+    path = str(tmp_path / "nested.vortex")
+    vx.io.write(df.to_arrow(), path)
+    return vx.open(path), df
+
+
+@pytest.mark.parametrize(
+    "predicate",
+    [
+        pl.col("st").struct.field("e") < "m",
+        pl.col("st").struct.field("e") >= "m",
+        pl.col("ls").list.first() < "m",
+        pl.col("ls").list.contains("m"),
+    ],
+)
+def test_to_polars_filters_on_nested_enum_match_polars(nested_enum_file, predicate) -> None:
+    vxf, df = nested_enum_file
+    assert vxf.to_polars().collect_schema() == df.schema
+    assert_frame_equal(vxf.to_polars().filter(predicate).collect(), df.filter(predicate))

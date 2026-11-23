@@ -32,8 +32,9 @@ def lazy_frame(
     """
     # A dictionary column is stored as its values, which compare as strings. Polars compares an
     # Enum or Categorical by its own order, so a predicate on one is left to Polars.
-    opaque = frozenset(field.name for field in schema if pa.types.is_dictionary(field.type))
-    stored = pa.schema([field.with_type(field.type.value_type) if field.name in opaque else field for field in schema])
+    # The column may nest the dictionary, as in a struct field or a list element.
+    opaque = frozenset(field.name for field in schema if _has_dictionary(field.type))
+    stored = pa.schema([field.with_type(_without_dictionaries(field.type)) for field in schema])
 
     # Type-checks translated predicates against the schema before scanning.
     scope = array(stored.empty_table())
@@ -92,6 +93,30 @@ def polars_to_vortex(expr: pl.Expr) -> ve.Expr:
     data = json.loads(expr.meta.serialize(format="json"))
     assert isinstance(data, dict)
     return _polars_to_vortex(data)
+
+
+def _has_dictionary(dtype: pa.DataType) -> bool:
+    """Whether ``dtype`` is, or contains, a dictionary type."""
+    if pa.types.is_dictionary(dtype):
+        return True
+    return any(_has_dictionary(dtype.field(i).type) for i in range(dtype.num_fields))
+
+
+def _without_dictionaries(dtype: pa.DataType) -> pa.DataType:
+    """``dtype`` with every dictionary replaced by its value type, as Vortex stores it."""
+    if pa.types.is_dictionary(dtype):
+        return _without_dictionaries(dtype.value_type)
+    if pa.types.is_struct(dtype):
+        return pa.struct([f.with_type(_without_dictionaries(f.type)) for f in dtype])
+    if pa.types.is_map(dtype):
+        return pa.map_(_without_dictionaries(dtype.key_type), _without_dictionaries(dtype.item_type))
+    if pa.types.is_fixed_size_list(dtype):
+        return pa.list_(dtype.value_field.with_type(_without_dictionaries(dtype.value_type)), dtype.list_size)
+    if pa.types.is_large_list(dtype):
+        return pa.large_list(dtype.value_field.with_type(_without_dictionaries(dtype.value_type)))
+    if pa.types.is_list(dtype):
+        return pa.list_(dtype.value_field.with_type(_without_dictionaries(dtype.value_type)))
+    return dtype
 
 
 def decompose_predicate(

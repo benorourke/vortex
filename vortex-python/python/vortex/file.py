@@ -197,8 +197,8 @@ class VortexFile:
 
         :func:`vortex.io.write` keeps the schema of the PyArrow table or reader it is given. Vortex
         stores a dictionary as plain UTF-8 and drops field metadata, so :meth:`dtype` alone cannot
-        say what the data was. Pass this schema as ``schema`` to :meth:`to_arrow` to read it back
-        with the original types.
+        say what the data was. Pass this schema as ``schema`` to :meth:`to_arrow`, when reading every
+        column, to get the original types back. :meth:`to_polars` does so itself.
 
         Examples
         --------
@@ -216,7 +216,13 @@ class VortexFile:
         DictionaryType(dictionary<values=string, indices=int32, ordered=0>)
         """
         raw = self._file.arrow_schema_ipc()
-        return None if raw is None else pa.ipc.read_schema(pa.py_buffer(raw))
+        if raw is None:
+            return None
+        try:
+            return pa.ipc.read_schema(pa.py_buffer(raw))
+        except pa.ArrowInvalid:
+            # Any writer can use this key. A segment that is not an Arrow schema says nothing.
+            return None
 
     @property
     def path(self) -> str:

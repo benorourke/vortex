@@ -458,12 +458,11 @@ async fn resolve_metadata(
     footer: &Footer,
     segment_source: Arc<dyn SegmentSource>,
 ) -> VortexResult<Arc<HashMap<String, ByteBuffer>>> {
-    let first_metadata_id = footer.segment_map().len();
     let requests = footer
         .metadata_segments()
         .enumerate()
         .map(|(index, (key, locator))| {
-            let id = u32::try_from(first_metadata_id + index).map(SegmentId::from);
+            let id = footer.metadata_segment_id(index);
             let key = key.to_string();
             let alignment = locator.alignment;
             let segment_source = Arc::clone(&segment_source);
