@@ -555,8 +555,6 @@ impl PyVortexFile {
         })
     }
 
-    /// The Arrow schema this file was written from, serialized as Arrow IPC, if it was written from
-    /// Arrow data (see :func:`vortex.io.write`). :meth:`vortex.VortexFile.arrow_schema` parses it.
     fn arrow_schema_ipc<'py>(&self, py: Python<'py>) -> PyVortexResult<Option<Bound<'py, PyBytes>>> {
         let segment = py.detach(|| {
             current_runtime()

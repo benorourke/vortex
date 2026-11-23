@@ -195,10 +195,8 @@ class VortexFile:
     def arrow_schema(self) -> pa.Schema | None:
         """The Arrow schema this file was written from, or ``None`` if it was not written from Arrow.
 
-        :func:`vortex.io.write` keeps the schema of the PyArrow table or reader it is given. Vortex
-        stores a dictionary as plain UTF-8 and drops field metadata, so :meth:`dtype` alone cannot
-        say what the data was. Pass this schema as ``schema`` to :meth:`to_arrow`, when reading every
-        column, to get the original types back. :meth:`to_polars` does so itself.
+        Vortex stores a dictionary as plain UTF-8, so :meth:`dtype` alone cannot say what the data
+        was. :meth:`to_polars` reads with this schema to return the original types.
 
         Examples
         --------
@@ -221,7 +219,6 @@ class VortexFile:
         try:
             return pa.ipc.read_schema(pa.py_buffer(raw))
         except pa.ArrowInvalid:
-            # Any writer can use this key. A segment that is not an Arrow schema says nothing.
             return None
 
     @property
@@ -458,12 +455,10 @@ class VortexFile:
         """
         from vortex.polars_ import lazy_frame
 
-        # Read back the types the file was written from, such as a Polars Enum, which Vortex stores
-        # as UTF-8 but Arrow can carry as a dictionary with field metadata.
-        schema = self.dtype.to_arrow_schema()
-        stored = self.arrow_schema()
-        if stored is not None and stored.names == schema.names:
-            schema = stored
+        stored_schema = self.dtype.to_arrow_schema()
+        schema = self.arrow_schema()
+        if schema is None or schema.names != stored_schema.names:
+            schema = stored_schema
 
         def read(columns: list[str] | None, predicate: Expr | None, limit: int | None) -> RecordBatchReader:
             wanted = schema if columns is None else pa.schema([schema.field(name) for name in columns])
@@ -471,4 +466,4 @@ class VortexFile:
                 projection=columns, expr=predicate, limit=limit, schema=wanted, concurrency=concurrency
             )
 
-        return lazy_frame(schema, read)
+        return lazy_frame(schema, read, stored_schema)

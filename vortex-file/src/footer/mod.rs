@@ -216,9 +216,7 @@ impl Footer {
             .find_map(|(candidate, segment)| (candidate == key).then_some(segment))
     }
 
-    /// The id of the `index`th user-defined metadata segment, in footer order.
-    ///
-    /// Metadata segments are numbered after the file's data segments.
+    /// Metadata segments are numbered after the data segments, in footer order.
     pub(crate) fn metadata_segment_id(&self, index: usize) -> VortexResult<SegmentId> {
         Ok(SegmentId::from(u32::try_from(
             self.segment_map().len() + index,

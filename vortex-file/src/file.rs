@@ -171,11 +171,8 @@ impl VortexFile {
         self.metadata.get(key)
     }
 
-    /// Reads the user-defined metadata segment for the given key.
-    ///
-    /// Unlike [`metadata_segment`](Self::metadata_segment), this needs no
-    /// [`include_metadata`](crate::VortexOpenOptions::include_metadata) at open: it reads just this
-    /// one segment, when asked. Returns `None` when the footer lists no such key.
+    /// Reads one user-defined metadata segment on demand, without
+    /// [`include_metadata`](crate::VortexOpenOptions::include_metadata) at open.
     pub async fn read_metadata_segment(&self, key: &str) -> VortexResult<Option<ByteBuffer>> {
         if let Some(loaded) = self.metadata.get(key) {
             return Ok(Some(loaded.clone()));

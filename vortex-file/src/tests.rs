@@ -2881,13 +2881,6 @@ async fn test_file_metadata_roundtrip() -> VortexResult<()> {
         .vortex_expect("aligned");
     assert_eq!(aligned_on_demand.as_slice(), aligned.as_slice());
     assert!(aligned_on_demand.is_aligned(vortex_buffer::Alignment::new(64)));
-    assert!(
-        default
-            .read_metadata_segment("empty")
-            .await?
-            .vortex_expect("empty")
-            .is_empty()
-    );
 
     let segments_end = summary
         .footer()

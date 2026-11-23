@@ -23,6 +23,7 @@ from .arrays import array
 def lazy_frame(
     schema: pa.Schema,
     read: Callable[[list[str] | None, ve.Expr | None, int | None], pa.RecordBatchReader],
+    stored_schema: pa.Schema | None = None,
 ) -> pl.LazyFrame:
     """A Polars LazyFrame over Vortex data, pushing column selection and predicates into ``read``.
 
@@ -30,14 +31,12 @@ def lazy_frame(
     ``predicate``. It may stop after ``limit`` rows or read past them: the frame trims the batches
     to the rows Polars asked for either way.
     """
-    # A dictionary column is stored as its values, which compare as strings. Polars compares an
-    # Enum or Categorical by its own order, so a predicate on one is left to Polars.
-    # The column may nest the dictionary, as in a struct field or a list element.
+    # Vortex compares a dictionary column as strings, but Polars compares an Enum by its categories'
+    # order, so a predicate on one (even nested in a struct or list) is left to Polars.
     opaque = frozenset(field.name for field in schema if _has_dictionary(field.type))
-    stored = pa.schema([field.with_type(_without_dictionaries(field.type)) for field in schema])
 
     # Type-checks translated predicates against the schema before scanning.
-    scope = array(stored.empty_table())
+    scope = array((stored_schema or schema).empty_table())
 
     def _io_source(
         with_columns: list[str] | None,
@@ -96,27 +95,9 @@ def polars_to_vortex(expr: pl.Expr) -> ve.Expr:
 
 
 def _has_dictionary(dtype: pa.DataType) -> bool:
-    """Whether ``dtype`` is, or contains, a dictionary type."""
     if pa.types.is_dictionary(dtype):
         return True
     return any(_has_dictionary(dtype.field(i).type) for i in range(dtype.num_fields))
-
-
-def _without_dictionaries(dtype: pa.DataType) -> pa.DataType:
-    """``dtype`` with every dictionary replaced by its value type, as Vortex stores it."""
-    if pa.types.is_dictionary(dtype):
-        return _without_dictionaries(dtype.value_type)
-    if pa.types.is_struct(dtype):
-        return pa.struct([f.with_type(_without_dictionaries(f.type)) for f in dtype])
-    if pa.types.is_map(dtype):
-        return pa.map_(_without_dictionaries(dtype.key_type), _without_dictionaries(dtype.item_type))
-    if pa.types.is_fixed_size_list(dtype):
-        return pa.list_(dtype.value_field.with_type(_without_dictionaries(dtype.value_type)), dtype.list_size)
-    if pa.types.is_large_list(dtype):
-        return pa.large_list(dtype.value_field.with_type(_without_dictionaries(dtype.value_type)))
-    if pa.types.is_list(dtype):
-        return pa.list_(dtype.value_field.with_type(_without_dictionaries(dtype.value_type)))
-    return dtype
 
 
 def decompose_predicate(
@@ -162,7 +143,6 @@ def decompose_predicate(
 
 
 def _reads_any(expr: dict[str, Any], columns: Collection[str]) -> bool:
-    """Whether the serialized Polars ``expr`` reads any of ``columns``."""
     polars_expr = pl.Expr.deserialize(io.BytesIO(json.dumps(expr).encode()), format="json")
     return not set(polars_expr.meta.root_names()).isdisjoint(columns)
 

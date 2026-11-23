@@ -458,10 +458,8 @@ impl PyVortexWriteOptions {
 /// The footer metadata key holding the Arrow schema (IPC bytes) a file was written from.
 pub(crate) const ARROW_SCHEMA_KEY: &str = "vortex.arrow.schema";
 
-/// The Arrow schema of a PyArrow table or reader, serialized as Arrow IPC.
-///
-/// Vortex has no logical type for every Arrow type: a dictionary becomes plain UTF-8 and the field
-/// metadata is dropped. The schema is kept so a reader can ask for the original types back.
+/// The Arrow schema of a PyArrow table or reader as IPC bytes, kept because Vortex stores a
+/// dictionary as plain UTF-8.
 fn arrow_schema_ipc(ob: &Bound<'_, PyAny>) -> PyResult<Option<Vec<u8>>> {
     let py = ob.py();
     if !(ob.is_instance(table_class(py)?)? || ob.is_instance(record_batch_reader_class(py)?)?) {
