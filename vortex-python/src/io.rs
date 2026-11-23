@@ -16,9 +16,11 @@ use vortex::array::IntoArray;
 use vortex::array::iter::ArrayIterator;
 use vortex::array::iter::ArrayIteratorAdapter;
 use vortex::array::iter::ArrayIteratorExt;
+use vortex::buffer::ByteBuffer;
 use vortex::compressor::BtrBlocksCompressorBuilder;
 use vortex::error::VortexError;
 use vortex::error::VortexResult;
+use vortex::file::VortexWriteOptions;
 use vortex::file::WriteOptionsSessionExt;
 use vortex::file::WriteStrategyBuilder;
 use vortex::io::VortexWrite;
@@ -248,19 +250,21 @@ impl<'py> FromPyObject<'_, 'py> for AnyVortexStore {
 #[pyo3(signature = (iter, path, *, store = None, edition = None))]
 pub fn write(
     py: Python,
-    iter: PyIntoArrayIterator,
+    iter: &Bound<'_, PyAny>,
     path: &str,
     store: Option<AnyVortexStore>,
     edition: Option<&str>,
 ) -> PyVortexResult<()> {
     let session = write_session(edition)?;
+    let arrow_schema = arrow_schema_ipc(iter)?;
+    let iter: PyIntoArrayIterator = iter.extract()?;
     py.detach(|| {
         current_runtime().block_on(async move {
+            let options = with_arrow_schema(session.write_options(), arrow_schema);
             match resolve_store(path, store.map(|x| x.into_inner()))? {
                 ResolvedStore::ObjectStore(store, path) => {
                     let mut store = ObjectStoreWrite::new(store, &path).await?;
-                    session
-                        .write_options()
+                    options
                         .write(&mut store, iter.into_inner().into_array_stream())
                         .await?;
                     store.shutdown().await?;
@@ -268,8 +272,7 @@ pub fn write(
                 }
                 ResolvedStore::Path(path) => {
                     let mut w = FileWrite::create(path, current_runtime().handle()).await?;
-                    session
-                        .write_options()
+                    options
                         .write(&mut w, iter.into_inner().into_array_stream())
                         .await?;
                     w.shutdown().await?;
@@ -409,11 +412,13 @@ impl PyVortexWriteOptions {
     pub fn write(
         &self,
         py: Python,
-        iter: PyIntoArrayIterator,
+        iter: &Bound<'_, PyAny>,
         path: &str,
         store: Option<AnyVortexStore>,
     ) -> PyVortexResult<()> {
         let session = write_session(self.edition.as_deref())?;
+        let arrow_schema = arrow_schema_ipc(iter)?;
+        let iter: PyIntoArrayIterator = iter.extract()?;
         py.detach(|| {
             let mut compressor = BtrBlocksCompressorBuilder::from_session(&session);
             if self.use_compact_encodings {
@@ -423,12 +428,12 @@ impl PyVortexWriteOptions {
                 WriteStrategyBuilder::from_session(&session).with_btrblocks_builder(compressor);
             let strategy = strategy.build();
             current_runtime().block_on(async move {
+                let options = with_arrow_schema(session.write_options(), arrow_schema)
+                    .with_strategy(strategy);
                 match resolve_store(path, store.map(|x| x.into_inner()))? {
                     ResolvedStore::ObjectStore(store, path) => {
                         let mut store = ObjectStoreWrite::new(store, &path).await?;
-                        session
-                            .write_options()
-                            .with_strategy(strategy)
+                        options
                             .write(&mut store, iter.into_inner().into_array_stream())
                             .await?;
                         store.shutdown().await?;
@@ -436,9 +441,7 @@ impl PyVortexWriteOptions {
                     }
                     ResolvedStore::Path(path) => {
                         let mut w = FileWrite::create(path, current_runtime().handle()).await?;
-                        session
-                            .write_options()
-                            .with_strategy(strategy)
+                        options
                             .write(&mut w, iter.into_inner().into_array_stream())
                             .await?;
                         w.shutdown().await?;
@@ -449,6 +452,29 @@ impl PyVortexWriteOptions {
         })?;
 
         Ok(())
+    }
+}
+
+/// The footer metadata key holding the Arrow schema (IPC bytes) a file was written from.
+pub(crate) const ARROW_SCHEMA_KEY: &str = "vortex.arrow.schema";
+
+/// The Arrow schema of a PyArrow table or reader, serialized as Arrow IPC.
+///
+/// Vortex has no logical type for every Arrow type: a dictionary becomes plain UTF-8 and the field
+/// metadata is dropped. The schema is kept so a reader can ask for the original types back.
+fn arrow_schema_ipc(ob: &Bound<'_, PyAny>) -> PyResult<Option<Vec<u8>>> {
+    let py = ob.py();
+    if !(ob.is_instance(table_class(py)?)? || ob.is_instance(record_batch_reader_class(py)?)?) {
+        return Ok(None);
+    }
+    let serialized = ob.getattr("schema")?.call_method0("serialize")?;
+    Ok(Some(serialized.call_method0("to_pybytes")?.extract()?))
+}
+
+fn with_arrow_schema(options: VortexWriteOptions, schema: Option<Vec<u8>>) -> VortexWriteOptions {
+    match schema {
+        Some(bytes) => options.with_metadata_segment(ARROW_SCHEMA_KEY, ByteBuffer::from(bytes)),
+        None => options,
     }
 }
 

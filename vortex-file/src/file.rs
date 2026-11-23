@@ -23,6 +23,7 @@ use vortex_layout::scan::metrics::ScanUsage;
 use vortex_layout::scan::scan_builder::ScanBuilder;
 use vortex_layout::scan::split_by::SplitBy;
 use vortex_layout::scan::v2::ScanFile;
+use vortex_layout::segments::SegmentId;
 use vortex_layout::segments::SegmentSource;
 use vortex_layout::segments::UsageSegmentSource;
 use vortex_scan::DataSourceRef;
@@ -169,6 +170,38 @@ impl VortexFile {
     /// Returns `None` when the key is absent or metadata was not loaded.
     pub fn metadata_segment(&self, key: &str) -> Option<&ByteBuffer> {
         self.metadata.get(key)
+    }
+
+    /// Reads the user-defined metadata segment for the given key.
+    ///
+    /// Unlike [`metadata_segment`](Self::metadata_segment), this needs no
+    /// [`include_metadata`](crate::VortexOpenOptions::include_metadata) at open: it reads just this
+    /// one segment, when asked. Returns `None` when the footer lists no such key.
+    pub async fn read_metadata_segment(&self, key: &str) -> VortexResult<Option<ByteBuffer>> {
+        if let Some(loaded) = self.metadata.get(key) {
+            return Ok(Some(loaded.clone()));
+        }
+        // Metadata segments are numbered after the file's data segments, in footer order.
+        let first_metadata_id = self.footer.segment_map().len();
+        let Some((index, (_, locator))) = self
+            .footer
+            .metadata_segments()
+            .enumerate()
+            .find(|(_, (candidate, _))| *candidate == key)
+        else {
+            return Ok(None);
+        };
+        let id = SegmentId::from(u32::try_from(first_metadata_id + index)?);
+        let buffer = self
+            .segment_source
+            .request(id)
+            .await?
+            .try_into_host()?
+            .await?;
+        Ok(Some(ByteBuffer::copy_from_aligned(
+            buffer.as_slice(),
+            locator.alignment,
+        )))
     }
 
     /// Create a new segment source for reading from the file.

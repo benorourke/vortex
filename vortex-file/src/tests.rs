@@ -2865,6 +2865,16 @@ async fn test_file_metadata_roundtrip() -> VortexResult<()> {
     assert_eq!(default.row_count(), 3);
     assert_eq!(default.metadata_segments().count(), 0);
     assert!(default.metadata_segment("json").is_none());
+    // A single segment can still be read on demand, without loading the others at open.
+    assert_eq!(
+        default
+            .read_metadata_segment("json")
+            .await?
+            .as_ref()
+            .map(ByteBuffer::as_slice),
+        Some(small.as_slice())
+    );
+    assert!(default.read_metadata_segment("missing").await?.is_none());
 
     let segments_end = summary
         .footer()

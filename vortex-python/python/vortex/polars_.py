@@ -6,7 +6,7 @@ from __future__ import annotations
 import io
 import json
 import operator
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Collection, Iterator
 from typing import Any, Literal, cast
 
 import polars as pl
@@ -30,8 +30,13 @@ def lazy_frame(
     ``predicate``. It may stop after ``limit`` rows or read past them: the frame trims the batches
     to the rows Polars asked for either way.
     """
+    # A dictionary column is stored as its values, which compare as strings. Polars compares an
+    # Enum or Categorical by its own order, so a predicate on one is left to Polars.
+    opaque = frozenset(field.name for field in schema if pa.types.is_dictionary(field.type))
+    stored = pa.schema([field.with_type(field.type.value_type) if field.name in opaque else field for field in schema])
+
     # Type-checks translated predicates against the schema before scanning.
-    scope = array(schema.empty_table())
+    scope = array(stored.empty_table())
 
     def _io_source(
         with_columns: list[str] | None,
@@ -45,7 +50,7 @@ def lazy_frame(
         vx_predicate: ve.Expr | None = None
         pl_predicate: pl.Expr | None = None
         if predicate is not None:
-            vx_predicate, pl_predicate = decompose_predicate(predicate, scope)
+            vx_predicate, pl_predicate = decompose_predicate(predicate, scope, opaque)
 
         # A row limit only commutes with the residual filter if there is none.
         limit = n_rows if pl_predicate is None else None
@@ -89,7 +94,9 @@ def polars_to_vortex(expr: pl.Expr) -> ve.Expr:
     return _polars_to_vortex(data)
 
 
-def decompose_predicate(predicate: pl.Expr, scope: Array | None = None) -> tuple[ve.Expr | None, pl.Expr | None]:
+def decompose_predicate(
+    predicate: pl.Expr, scope: Array | None = None, opaque: Collection[str] = ()
+) -> tuple[ve.Expr | None, pl.Expr | None]:
     """Split a Polars predicate into a pushable Vortex expression and a Polars residual.
 
     The predicate is decomposed into its top-level AND conjuncts. A conjunct that converts to
@@ -105,6 +112,8 @@ def decompose_predicate(predicate: pl.Expr, scope: Array | None = None) -> tuple
     scan binds them to the data, such as a bitwise ``&`` of integers, which Polars serializes
     like a logical one.
 
+    A conjunct that reads any column in ``opaque`` is never pushed: it stays in the residual.
+
     Returns ``(vortex_expr | None, residual_polars_expr | None)``. Filtering by the Vortex
     expression and then by the residual is equivalent to filtering by the original
     predicate, so both parts must be applied when present.
@@ -115,13 +124,22 @@ def decompose_predicate(predicate: pl.Expr, scope: Array | None = None) -> tuple
     pushed: ve.Expr | None = None
     residual: pl.Expr | None = None
     for conjunct in _conjuncts(data):
-        exact, implied = _implied_predicate(conjunct, scope)
+        if opaque and _reads_any(conjunct, opaque):
+            exact, implied = False, None
+        else:
+            exact, implied = _implied_predicate(conjunct, scope)
         if implied is not None:
             pushed = implied if pushed is None else pushed & implied
         if not exact:
             expr = pl.Expr.deserialize(io.BytesIO(json.dumps(conjunct).encode()), format="json")
             residual = expr if residual is None else residual & expr
     return pushed, residual
+
+
+def _reads_any(expr: dict[str, Any], columns: Collection[str]) -> bool:
+    """Whether the serialized Polars ``expr`` reads any of ``columns``."""
+    polars_expr = pl.Expr.deserialize(io.BytesIO(json.dumps(expr).encode()), format="json")
+    return not set(polars_expr.meta.root_names()).isdisjoint(columns)
 
 
 def _conjuncts(expr: dict[str, Any]) -> Iterator[dict[str, Any]]:

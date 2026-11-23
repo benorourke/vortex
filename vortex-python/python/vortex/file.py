@@ -192,6 +192,32 @@ class VortexFile:
         """The dtype of the file."""
         return self._file.dtype
 
+    def arrow_schema(self) -> pa.Schema | None:
+        """The Arrow schema this file was written from, or ``None`` if it was not written from Arrow.
+
+        :func:`vortex.io.write` keeps the schema of the PyArrow table or reader it is given. Vortex
+        stores a dictionary as plain UTF-8 and drops field metadata, so :meth:`dtype` alone cannot
+        say what the data was. Pass this schema as ``schema`` to :meth:`to_arrow` to read it back
+        with the original types.
+
+        Examples
+        --------
+
+        >>> import os, tempfile
+        >>> import pyarrow as pa
+        >>> import vortex as vx
+        >>> t = pa.table({"a": pa.array(["x", "y", "x"]).dictionary_encode()})
+        >>> path = os.path.join(tempfile.mkdtemp(), "dict.vortex")
+        >>> vx.io.write(t, path)
+        >>> f = vx.open(path)
+        >>> f.dtype
+        struct({"a": utf8(nullable=True)}, nullable=False)
+        >>> f.arrow_schema().field("a").type
+        DictionaryType(dictionary<values=string, indices=int32, ordered=0>)
+        """
+        raw = self._file.arrow_schema_ipc()
+        return None if raw is None else pa.ipc.read_schema(pa.py_buffer(raw))
+
     @property
     def path(self) -> str:
         """The path or URL this file was opened from."""
@@ -426,7 +452,17 @@ class VortexFile:
         """
         from vortex.polars_ import lazy_frame
 
-        def read(columns: list[str] | None, predicate: Expr | None, limit: int | None) -> RecordBatchReader:
-            return self.to_arrow(projection=columns, expr=predicate, limit=limit, concurrency=concurrency)
+        # Read back the types the file was written from, such as a Polars Enum, which Vortex stores
+        # as UTF-8 but Arrow can carry as a dictionary with field metadata.
+        schema = self.dtype.to_arrow_schema()
+        stored = self.arrow_schema()
+        if stored is not None and stored.names == schema.names:
+            schema = stored
 
-        return lazy_frame(self.dtype.to_arrow_schema(), read)
+        def read(columns: list[str] | None, predicate: Expr | None, limit: int | None) -> RecordBatchReader:
+            wanted = schema if columns is None else pa.schema([schema.field(name) for name in columns])
+            return self.to_arrow(
+                projection=columns, expr=predicate, limit=limit, schema=wanted, concurrency=concurrency
+            )
+
+        return lazy_frame(schema, read)
