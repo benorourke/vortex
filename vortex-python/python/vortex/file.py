@@ -192,6 +192,35 @@ class VortexFile:
         """The dtype of the file."""
         return self._file.dtype
 
+    def arrow_schema(self) -> pa.Schema | None:
+        """The Arrow schema this file was written from, or ``None`` if it was not written from Arrow.
+
+        Vortex stores a dictionary as plain UTF-8, so :meth:`dtype` alone cannot say what the data
+        was. :meth:`to_polars` reads with this schema to return the original types.
+
+        Examples
+        --------
+
+        >>> import os, tempfile
+        >>> import pyarrow as pa
+        >>> import vortex as vx
+        >>> t = pa.table({"a": pa.array(["x", "y", "x"]).dictionary_encode()})
+        >>> path = os.path.join(tempfile.mkdtemp(), "dict.vortex")
+        >>> vx.io.write(t, path)
+        >>> f = vx.open(path)
+        >>> f.dtype
+        struct({"a": utf8(nullable=True)}, nullable=False)
+        >>> f.arrow_schema().field("a").type
+        DictionaryType(dictionary<values=string, indices=int32, ordered=0>)
+        """
+        raw = self._file.arrow_schema_ipc()
+        if raw is None:
+            return None
+        try:
+            return pa.ipc.read_schema(pa.py_buffer(raw))
+        except pa.ArrowInvalid:
+            return None
+
     @property
     def path(self) -> str:
         """The path or URL this file was opened from."""
@@ -426,7 +455,15 @@ class VortexFile:
         """
         from vortex.polars_ import lazy_frame
 
-        def read(columns: list[str] | None, predicate: Expr | None, limit: int | None) -> RecordBatchReader:
-            return self.to_arrow(projection=columns, expr=predicate, limit=limit, concurrency=concurrency)
+        stored_schema = self.dtype.to_arrow_schema()
+        schema = self.arrow_schema()
+        if schema is None or schema.names != stored_schema.names:
+            schema = stored_schema
 
-        return lazy_frame(self.dtype.to_arrow_schema(), read)
+        def read(columns: list[str] | None, predicate: Expr | None, limit: int | None) -> RecordBatchReader:
+            wanted = schema if columns is None else pa.schema([schema.field(name) for name in columns])
+            return self.to_arrow(
+                projection=columns, expr=predicate, limit=limit, schema=wanted, concurrency=concurrency
+            )
+
+        return lazy_frame(schema, read, stored_schema)

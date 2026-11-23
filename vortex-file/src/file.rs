@@ -171,6 +171,33 @@ impl VortexFile {
         self.metadata.get(key)
     }
 
+    /// Reads one user-defined metadata segment on demand, without
+    /// [`include_metadata`](crate::VortexOpenOptions::include_metadata) at open.
+    pub async fn read_metadata_segment(&self, key: &str) -> VortexResult<Option<ByteBuffer>> {
+        if let Some(loaded) = self.metadata.get(key) {
+            return Ok(Some(loaded.clone()));
+        }
+        let Some((index, (_, locator))) = self
+            .footer
+            .metadata_segments()
+            .enumerate()
+            .find(|(_, (candidate, _))| *candidate == key)
+        else {
+            return Ok(None);
+        };
+        let id = self.footer.metadata_segment_id(index)?;
+        let buffer = self
+            .segment_source
+            .request(id)
+            .await?
+            .try_into_host()?
+            .await?;
+        Ok(Some(ByteBuffer::copy_from_aligned(
+            buffer.as_slice(),
+            locator.alignment,
+        )))
+    }
+
     /// Create a new segment source for reading from the file.
     ///
     /// This may spawn a background I/O driver that will exit when the returned segment source

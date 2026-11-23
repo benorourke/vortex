@@ -11,6 +11,7 @@ use pyo3::exceptions::PyTypeError;
 use pyo3::exceptions::PyValueError;
 use pyo3::intern;
 use pyo3::prelude::*;
+use pyo3::types::PyBytes;
 use pyo3::types::PyList;
 use vortex::array::ArrayRef;
 use vortex::array::VortexSessionExecute;
@@ -552,6 +553,14 @@ impl PyVortexFile {
             scan: Arc::new(scan),
             row_count: slf.get().vxf.row_count(),
         })
+    }
+
+    fn arrow_schema_ipc<'py>(&self, py: Python<'py>) -> PyVortexResult<Option<Bound<'py, PyBytes>>> {
+        let segment = py.detach(|| {
+            current_runtime()
+                .block_on(self.vxf.read_metadata_segment(crate::io::ARROW_SCHEMA_KEY))
+        })?;
+        Ok(segment.map(|bytes| PyBytes::new(py, bytes.as_slice())))
     }
 
     #[pyo3(signature = (projection = None, *, expr = None, limit = None, indices = None, batch_size = None, schema = None, concurrency = None))]

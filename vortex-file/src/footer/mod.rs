@@ -36,6 +36,7 @@ use vortex_io::segments::SegmentLocation;
 use vortex_layout::LayoutId;
 use vortex_layout::LayoutRef;
 use vortex_layout::layout_from_flatbuffer_with_options;
+use vortex_layout::segments::SegmentId;
 use vortex_session::VortexSession;
 use vortex_session::registry::ReadContext;
 
@@ -213,6 +214,13 @@ impl Footer {
         self.metadata
             .iter()
             .find_map(|(candidate, segment)| (candidate == key).then_some(segment))
+    }
+
+    /// Metadata segments are numbered after the data segments, in footer order.
+    pub(crate) fn metadata_segment_id(&self, index: usize) -> VortexResult<SegmentId> {
+        Ok(SegmentId::from(u32::try_from(
+            self.segment_map().len() + index,
+        )?))
     }
 
     pub(crate) fn with_metadata_segments(mut self, metadata: Arc<[(String, SegmentSpec)]>) -> Self {

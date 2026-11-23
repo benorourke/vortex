@@ -616,3 +616,62 @@ def test_to_polars_with_predicate_vortex_rejects(tmp_path, predicate):
     expected = pl.DataFrame(table).lazy().filter(predicate).collect()
     actual = vx.open(str(path)).to_polars().filter(predicate).collect()
     assert_frame_equal(actual, expected)
+
+
+# Categories out of alphabetical order: an Enum compares by category order, so `e < "m"` differs
+# from the comparison of the strings Vortex stores.
+ENUM = pl.Enum(["z", "m", "a"])
+
+
+@pytest.fixture
+def enum_file(tmp_path) -> tuple[vx.VortexFile, pl.DataFrame]:
+    df = pl.DataFrame(
+        {
+            "i": list(range(4)),
+            "e": pl.Series(["a", "z", "m", None], dtype=ENUM),
+            "c": pl.Series(["x", "y", None, "x"], dtype=pl.Categorical),
+            "st": pl.Series([{"e": "a"}, {"e": "z"}, {"e": "m"}, {"e": None}], dtype=pl.Struct({"e": ENUM})),
+        }
+    )
+    path = str(tmp_path / "enum.vortex")
+    vx.io.write(df.to_arrow(), path)
+    return vx.open(path), df
+
+
+def test_to_polars_restores_enum_and_categorical(enum_file) -> None:
+    vxf, df = enum_file
+    assert vxf.to_polars().collect_schema() == df.schema
+    assert_frame_equal(vxf.to_polars().select("e", "st").head(3).collect(), df.select("e", "st").head(3))
+
+
+@pytest.mark.parametrize(
+    "predicate",
+    [
+        pl.col("e") == "m",
+        pl.col("e") < "m",
+        ~(pl.col("e") >= "m"),
+        pl.col("st").struct.field("e") < "m",
+        (pl.col("e") < "m") & (pl.col("i") > 0),
+    ],
+)
+def test_to_polars_filters_on_enum_match_polars(enum_file, predicate) -> None:
+    vxf, df = enum_file
+    assert_frame_equal(vxf.to_polars().filter(predicate).collect(), df.filter(predicate))
+
+
+def test_decompose_predicate_leaves_opaque_columns_to_polars() -> None:
+    pushed, residual = decompose_predicate((pl.col("e") < "m") & (pl.col("i") > 2), opaque={"e"})
+    assert pushed is not None
+    assert residual is not None
+    assert residual.meta.root_names() == ["e"]
+
+
+def test_arrow_schema_roundtrip_and_absent(tmp_path) -> None:
+    table = pa.table({"a": pa.array(["x", "y"]).dictionary_encode()})
+    written = str(tmp_path / "a.vortex")
+    vx.io.write(table, written)
+    assert vx.open(written).arrow_schema() == table.schema
+
+    plain = str(tmp_path / "b.vortex")
+    vx.io.write(vx.array([1, 2, 3]), plain)
+    assert vx.open(plain).arrow_schema() is None
